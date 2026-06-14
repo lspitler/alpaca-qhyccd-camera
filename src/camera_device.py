@@ -1022,8 +1022,11 @@ class CameraDevice:
             raise RuntimeError("SetQHYCCDParam(EXPOSURE) failed")
 
         # Start the exposure
+        # Note: ExpQHYCCDSingleFrame returns QHY_ERROR (0xFFFFFFFF) on actual
+        # failure but may return other non-zero values as a "pending" status
+        # on some cameras (e.g. QHY174GPS). Only treat QHY_ERROR as fatal.
         res = self.libqhyccd.ExpQHYCCDSingleFrame(self.handle)
-        if res != QHY_SUCCESS:
+        if res == QHY_ERROR:
             raise RuntimeError("ExpQHYCCDSingleFrame failed")
 
         self._camera_state = CameraState.EXPOSING
@@ -1057,8 +1060,8 @@ class CameraDevice:
     def _wait_for_image(self) -> None:
         """Wait for readout to complete, then mark image as ready."""
         self._readout_complete.wait()
-        self._camera_state = CameraState.DOWNLOADING
         self._image_ready = True
+        self._camera_state = CameraState.IDLE
 
     def abort_exposure(self) -> None:
         if self._camera_state in (
