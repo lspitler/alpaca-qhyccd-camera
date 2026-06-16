@@ -54,6 +54,12 @@ class DeviceConfig(BaseModel):
     entity: str = Field(default="Camera")
     device_number: int = Field(default=0)
     serial_number: str = Field(default="")
+    sensor_bpp: int = Field(
+        default=16,
+        description="Native ADC bit depth of the sensor (e.g. 12 for QHY174GPS, "
+        "14 for QHY268C, 16 for QHY600). The SDK always delivers 16-bit data; "
+        "pixels are right-shifted by (16 - sensor_bpp) to produce true ADU values.",
+    )
     defaults: DeviceDefaults = Field(default_factory=DeviceDefaults)
 
 

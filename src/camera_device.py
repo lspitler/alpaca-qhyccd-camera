@@ -49,6 +49,7 @@ class CameraDevice:
         self._lock = Lock()
         self._config = device_config
         self._library_path = library_path
+        self._sensor_bpp = device_config.sensor_bpp
 
         self.libqhyccd = None
         self.handle = None
@@ -262,10 +263,10 @@ class CameraDevice:
         self._pixel_size_x = pix_w.value
         self._pixel_size_y = pix_h.value
 
-        logger.debug(
+        logger.info(
             f"Chip info: {self._camera_x_size}x{self._camera_y_size}, "
             f"pixel size: {self._pixel_size_x}x{self._pixel_size_y} um, "
-            f"bpp: {bpp.value}"
+            f"transfer bpp: {bpp.value}, sensor bpp: {self._sensor_bpp}"
         )
 
         # Query effective area for debug purposes
@@ -776,12 +777,18 @@ class CameraDevice:
         # Build the ASCOM-shaped image: native buffer is row-major (H, W);
         # ASCOM ImageArray indexes as [x, y] so we transpose to (W, H).
         # ASCOM spec requires ImageArray to return Int32 values.
+        #
+        # QHY cameras with sub-16-bit ADCs (e.g. 12-bit QHY174GPS) left-shift
+        # data into 16-bit words.  Right-shift back to true ADU values so that
+        # downstream consumers see the native dynamic range.
+        shift = 16 - self._sensor_bpp  # 0 for native 16-bit sensors
         img = (
             np.frombuffer(
                 data, dtype=np.uint16, offset=0, count=img_w.value * img_h.value
             )
             .reshape(img_h.value, img_w.value)
             .T.astype(np.int32)
+            >> shift
         )
 
         self._camera_state = CameraState.IDLE
@@ -821,7 +828,7 @@ class CameraDevice:
 
     @property
     def max_adu(self) -> int:
-        return 65535
+        return (1 << self._sensor_bpp) - 1  # e.g. 4095 for 12-bit, 65535 for 16-bit
 
     @property
     def max_bin_x(self) -> int:
