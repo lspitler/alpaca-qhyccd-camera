@@ -55,16 +55,22 @@ class CFWDevice:
     # ─── ASCOM Common ────────────────────────────────────────────────
 
     def connect(self) -> None:
-        """Connect to the filter wheel (requires camera already connected)."""
+        """Connect to the filter wheel (waits for camera to connect first)."""
         if self._connected or self._connecting:
             return
 
         self._connecting = True
         try:
+            # Wait up to 30s for the camera to finish connecting
             if not self._camera.connected:
-                raise RuntimeError(
-                    "Camera must be connected before the filter wheel"
-                )
+                logger.info("Waiting for camera to connect before filter wheel...")
+                deadline = time.time() + 30
+                while not self._camera.connected and time.time() < deadline:
+                    time.sleep(0.5)
+                if not self._camera.connected:
+                    raise RuntimeError(
+                        "Timed out waiting for camera to connect (30s)"
+                    )
 
             # Declare CFW function signatures if not already done
             self._ensure_cfw_signatures()
