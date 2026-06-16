@@ -312,10 +312,10 @@ async def position_put(
         return MethodResponse.create(
             client_transaction_id=params.client_transaction_id,
         ).model_dump()
-    except CFWBusyError as ex:
+    except ValueError as ex:
         return MethodResponse.create(
             client_transaction_id=params.client_transaction_id,
-            error=InvalidOperationException(str(ex)),
+            error=InvalidValueException(str(ex)),
         ).model_dump()
     except Exception as ex:
         return MethodResponse.create(

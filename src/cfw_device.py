@@ -41,6 +41,7 @@ class CFWDevice:
         self._connecting = False
         self._moving = False
         self._position: int = -1
+        self._move_target: int = -1
 
     @property
     def _handle(self):
@@ -55,21 +56,19 @@ class CFWDevice:
     # ─── ASCOM Common ────────────────────────────────────────────────
 
     def connect(self) -> None:
-        """Connect to the filter wheel (waits for camera to connect first)."""
+        """Connect to the filter wheel (auto-connects camera if needed)."""
         if self._connected or self._connecting:
             return
 
         self._connecting = True
         try:
-            # Wait up to 30s for the camera to finish connecting
+            # Auto-connect the camera if it isn't already connected
             if not self._camera.connected:
-                logger.info("Waiting for camera to connect before filter wheel...")
-                deadline = time.time() + 30
-                while not self._camera.connected and time.time() < deadline:
-                    time.sleep(0.5)
+                logger.info("Auto-connecting camera for filter wheel...")
+                self._camera.connected = True
                 if not self._camera.connected:
                     raise RuntimeError(
-                        "Timed out waiting for camera to connect (30s)"
+                        "Failed to auto-connect camera for filter wheel"
                     )
 
             # Declare CFW function signatures if not already done
@@ -100,6 +99,8 @@ class CFWDevice:
         """Disconnect from the filter wheel."""
         self._connected = False
         self._moving = False
+        self._move_target = -1
+        self._position = -1
         logger.info(f"Disconnected from filter wheel: {self._config.entity}")
 
     @property
@@ -140,11 +141,13 @@ class CFWDevice:
 
     @position.setter
     def position(self, value: int) -> None:
-        """Command the wheel to move to a position (0-based)."""
+        """Command the wheel to move to a position (0-based).
+
+        Per ASCOM IFilterWheelV3, issuing a new position while moving
+        redirects the wheel — it does NOT raise an error.
+        """
         if not self._connected:
             raise RuntimeError("Filter wheel is not connected")
-        if self._moving:
-            raise CFWBusyError("Filter wheel is currently moving")
 
         num_filters = len(self._config.names)
         if value < 0 or value >= num_filters:
@@ -158,6 +161,8 @@ class CFWDevice:
         if res != QHY_SUCCESS:
             raise RuntimeError(f"SendOrder2QHYCCDCFW failed (res={res})")
 
+        # Signal any existing move thread to stop, then start a new one
+        self._move_target = value
         self._moving = True
         logger.info(f"Moving filter wheel to position {value}")
         threading.Thread(
@@ -192,7 +197,9 @@ class CFWDevice:
         """Query current filter wheel position from SDK.
 
         GetQHYCCDCFWStatus writes a short string into the buffer.
-        Typical response is a single ASCII digit or a multi-char status.
+        The QHY SDK returns the position as a single byte whose VALUE is
+        the 0-based position number (NOT an ASCII character). Some firmware
+        versions return ASCII digits, so we handle both.
         """
         buf = create_string_buffer(64)
         res = self._lib.GetQHYCCDCFWStatus(self._handle, buf)
@@ -200,42 +207,84 @@ class CFWDevice:
             logger.warning(f"GetQHYCCDCFWStatus failed (res={res})")
             return -1
 
-        status = buf.value.decode().strip()
-        logger.debug(f"CFW status: {status!r}")
+        raw = buf.raw
+        # The SDK writes at least one byte — check the raw byte value
+        byte_val = raw[0]
 
-        # The SDK typically returns the position as a single character
-        # or a string like "N" where N is the 0-based position digit.
-        # It may also return special values during movement.
-        if status and status[0].isdigit():
-            return int(status[0])
+        # Some QHY firmware returns an ASCII digit character ('0'=0x30, etc.)
+        # Others return the raw position number (0x00, 0x01, etc.)
+        # A value of 0xFF or similar means "moving" or "unknown"
+        num_filters = len(self._config.names)
 
-        # If we can't parse a position, assume moving
+        if byte_val < num_filters:
+            # Raw position byte (0, 1, 2, ...)
+            logger.debug(f"CFW status raw byte: {byte_val} -> position {byte_val}")
+            return byte_val
+        elif ord('0') <= byte_val <= ord('9'):
+            # ASCII digit character
+            pos = byte_val - ord('0')
+            logger.debug(f"CFW status ASCII byte: {chr(byte_val)} -> position {pos}")
+            return pos
+
+        # Try decoding as string for multi-byte responses
+        try:
+            status = buf.value.decode().strip()
+            if status and status[0].isdigit():
+                pos = int(status[0])
+                logger.debug(f"CFW status string: {status!r} -> position {pos}")
+                return pos
+        except (UnicodeDecodeError, ValueError):
+            pass
+
+        logger.debug(f"CFW status unrecognized: raw[0]={byte_val:#04x}, treating as moving")
         return -1
 
     def _wait_for_move(self, target: int) -> None:
-        """Poll CFW status until the target position is reached or timeout."""
+        """Poll CFW status until the target position is reached or timeout.
+
+        If a new move is commanded (self._move_target changes), this thread
+        exits silently — the new thread takes over monitoring.
+
+        The QHY SDK may briefly return the OLD position before the wheel
+        physically starts moving, so we require seeing a transition:
+        either reading -1 (moving) first, or reading the target position
+        after a brief settling delay.
+        """
         timeout = self._config.timeout
         t0 = time.time()
+        saw_moving_or_different = False
 
-        # Give the wheel a moment to start moving
-        time.sleep(1)
+        # Brief delay for the move command to take effect in hardware
+        time.sleep(0.3)
 
-        while self._moving:
+        while self._moving and self._move_target == target:
             pos = self._read_position()
-            if pos == target:
-                self._position = target
-                self._moving = False
-                logger.info(f"Filter wheel arrived at position {target}")
-                return
+
+            if pos == -1 or (pos >= 0 and pos != target):
+                # Wheel is either in motion or at an intermediate position
+                saw_moving_or_different = True
+            elif pos == target:
+                if saw_moving_or_different or (time.time() - t0) > 0.5:
+                    # We either saw the wheel move, or enough time has passed
+                    # that we trust the SDK is reporting the final position
+                    self._position = target
+                    self._moving = False
+                    logger.info(f"Filter wheel arrived at position {target}")
+                    return
 
             if (time.time() - t0) > timeout:
-                self._moving = False
-                logger.error(
-                    f"Filter wheel move to {target} timed out after {timeout}s"
-                )
-                # Update position to whatever we last read
-                if pos >= 0:
-                    self._position = pos
+                # Only clear moving state if we're still the active move
+                if self._move_target == target:
+                    self._moving = False
+                    logger.error(
+                        f"Filter wheel move to {target} timed out after {timeout}s"
+                    )
+                    if pos >= 0:
+                        self._position = pos
                 return
 
-            time.sleep(1)
+            # Check if this thread was superseded
+            if self._move_target != target:
+                return
+
+            time.sleep(0.3)
