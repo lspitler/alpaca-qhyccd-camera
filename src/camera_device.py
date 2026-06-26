@@ -1116,14 +1116,6 @@ class CameraDevice:
         if res != QHY_SUCCESS:
             raise RuntimeError("SetQHYCCDParam(EXPOSURE) failed")
 
-        # Start the exposure
-        # Note: ExpQHYCCDSingleFrame returns QHY_ERROR (0xFFFFFFFF) on actual
-        # failure but may return other non-zero values as a "pending" status
-        # on some cameras (e.g. QHY174GPS). Only treat QHY_ERROR as fatal.
-        res = self.libqhyccd.ExpQHYCCDSingleFrame(self.handle)
-        if res == QHY_ERROR:
-            raise RuntimeError("ExpQHYCCDSingleFrame failed")
-
         self._camera_state = CameraState.EXPOSING
         self._image_ready = False
         self._cached_image = None
@@ -1133,29 +1125,49 @@ class CameraDevice:
         self._timing["DATE-OBS"] = Time.now().isot
         self._last_exposure_start_time = self._timing["DATE-OBS"]
 
-        # Start background state transition threads
+        # Drive the (blocking) SDK exposure off the request thread so this
+        # method returns immediately, per the asynchronous ASCOM StartExposure
+        # contract. ExpQHYCCDSingleFrame blocks for ~the exposure duration on
+        # cameras like the QHY174GPS; running it inline would hold the HTTP
+        # handler open and trip the Alpaca client's PUT read timeout.
         self._exposure_complete.clear()
         self._readout_complete.clear()
-        Thread(target=self._exposure_timer, args=(duration,), daemon=True).start()
-        Thread(target=self._readout_timer, daemon=True).start()
-        Thread(target=self._wait_for_image, daemon=True).start()
+        Thread(target=self._run_exposure, args=(duration,), daemon=True).start()
 
-    def _exposure_timer(self, duration: float) -> None:
-        """Timer thread to transition camera state after exposure completes."""
-        time.sleep(duration)
+    def _run_exposure(self, duration: float) -> None:
+        """Worker that runs a single-frame exposure and advances camera state.
+
+        Note: ExpQHYCCDSingleFrame returns QHY_ERROR (0xFFFFFFFF) on actual
+        failure but may return other non-zero values as a "pending" status on
+        some cameras (e.g. QHY174GPS). Only treat QHY_ERROR as fatal. The call
+        blocks for ~the exposure duration on the QHY174GPS but may return early
+        on other cameras, so we wait out any remaining time before advancing.
+        """
+        t0 = time.monotonic()
+        res = self.libqhyccd.ExpQHYCCDSingleFrame(self.handle)
+        if res == QHY_ERROR:
+            logger.error("ExpQHYCCDSingleFrame failed")
+            self._camera_state = CameraState.ERROR
+            self._exposure_complete.set()
+            self._readout_complete.set()
+            return
+
+        # If aborted while the SDK call was blocked, abort_exposure has already
+        # reset state and signalled the events — don't clobber it.
+        if self._camera_state != CameraState.EXPOSING:
+            return
+
+        remaining = duration - (time.monotonic() - t0)
+        if remaining > 0:
+            time.sleep(remaining)
+
         self._camera_state = CameraState.READING
         self._exposure_complete.set()
 
-    def _readout_timer(self) -> None:
-        """Timer thread to signal readout completion."""
-        self._exposure_complete.wait()
-        # No way to monitor transition, just blow through it for now
+        # No way to monitor the readout transition, just blow through it for now
         time.sleep(0.1)
         self._readout_complete.set()
 
-    def _wait_for_image(self) -> None:
-        """Wait for readout to complete, then mark image as ready."""
-        self._readout_complete.wait()
         self._image_ready = True
         self._camera_state = CameraState.IDLE
 
