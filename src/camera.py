@@ -232,6 +232,22 @@ async def driverinfo(devnum: int, params: AlpacaGetParams = Depends()):
     ).model_dump()
 
 
+@router.get("/{devnum}/gpsmetadata", summary="")
+async def gpsmetadata(devnum: int, params: AlpacaGetParams = Depends()):
+    """Non-standard extension: per-frame GPS/timing metadata for the last
+    readout (TIME-SRC, DATE-END, GPS status/position, sequence number).
+
+    Returns the device's _timing dict; keys present depend on GPS lock and
+    precise-timing support. Consumers (e.g. sensorkit) read this to populate
+    FITS timing keywords and to observe GPS lock state per frame.
+    """
+    device = get_device(devnum)
+    return PropertyResponse.create(
+        value=dict(device._timing),
+        client_transaction_id=params.client_transaction_id,
+    ).model_dump()
+
+
 @router.get("/{devnum}/driverversion", summary="")
 async def driverversion(devnum: int, params: AlpacaGetParams = Depends()):
     get_device(devnum)

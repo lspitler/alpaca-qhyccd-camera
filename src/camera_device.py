@@ -739,6 +739,12 @@ class CameraDevice:
         try:
             gps = QHY_GPS.from_address(addressof(data))
             vsync_status = gps.create_status(gps.NowFlag)
+            # Always surface the GPS module status (and last-known position) via
+            # the gpsmetadata endpoint, even when we fall back to the system
+            # clock — lets consumers see LOCKED/LOCKING/SEARCHING/OFFLINE per frame.
+            self._timing["GPS-STAT"] = vsync_status
+            self._timing["GPS-LAT"] = gps.Latitude
+            self._timing["GPS-LON"] = gps.Longitude
             if vsync_status in ["LOCKED", "LOCKING"] and has_precise_info:
                 end_seconds = (
                     gps.NowSeconds
@@ -767,7 +773,8 @@ class CameraDevice:
                     logger.warning(f"GPS is {vsync_status}, using system clock")
                 else:
                     logger.warning(
-                        "GPS locked but no precise exposure info, using system clock"
+                        f"GPS {vsync_status} but no precise exposure info "
+                        "(QHY174 SDK class lacks it), using system clock"
                     )
                 self._use_system_clock_timing()
         except Exception as e:
