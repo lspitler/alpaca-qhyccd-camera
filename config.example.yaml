@@ -8,6 +8,10 @@ devices:
   - entity: QHY600M
     device_number: 0
     serial_number: ""  # Leave empty to use first camera found
+    # Native ADC bit depth of the sensor. The SDK always delivers 16-bit data;
+    # pixels are right-shifted by (16 - sensor_bpp) to give true ADU values.
+    # 12 for QHY174GPS, 14 for QHY268C, 16 for QHY600 (the default).
+    sensor_bpp: 16
     defaults:
       temperature: -10
       readout_mode: 0
