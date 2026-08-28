@@ -756,6 +756,44 @@ class CameraDevice:
             try:
                 gps = QHY_GPS.from_address(addressof(data))
                 vsync_status = gps.create_status(gps.NowFlag)
+                start_status = gps.create_status(gps.StartFlag)
+                end_status = gps.create_status(gps.EndFlag)
+                start_counts = int.from_bytes(bytes(gps.StartCounts), "big")
+                end_counts = int.from_bytes(bytes(gps.EndCounts), "big")
+                now_counts = int.from_bytes(bytes(gps.NowCounts), "big")
+                # DIAGNOSTIC: dump every field of the GPS struct. ImageWidth and
+                # ImageHeight should match the sensor (1920x1200 on a QHY174) —
+                # if they do not, the struct is mis-aligned against the frame
+                # buffer and every other field here is meaningless.
+                logger.debug(
+                    f"GPS raw: seq={gps.SequenceNumber} w={gps.ImageWidth} "
+                    f"h={gps.ImageHeight} | start={start_status}(flag={gps.StartFlag}) "
+                    f"ssec={gps.StartSeconds} scnt={start_counts} "
+                    f"| end={end_status}(flag={gps.EndFlag}) "
+                    f"esec={gps.EndSeconds} ecnt={end_counts} "
+                    f"| now={vsync_status}(flag={gps.NowFlag}) "
+                    f"nsec={gps.NowSeconds} ncnt={now_counts} "
+                    f"| pps={gps.PPSDelta} lat={gps.Latitude} lon={gps.Longitude} "
+                    f"| d_sec={gps.EndSeconds - gps.StartSeconds} "
+                    f"d_cnt={end_counts - start_counts}"
+                )
+                # Host-vs-GPS clock skew, measured at the same instant: the Now
+                # latch is the frame end and we read the system clock immediately
+                # after fetching that frame, so the difference is the system
+                # clock error plus a sub-ms readout delay. This is the number
+                # that justifies GPS timing at all.
+                try:
+                    _gps_now = gps.create_timestamp(gps.NowSeconds, gps.NowCounts)
+                    _skew_ms = (
+                        Time.now() - Time(_gps_now, format="isot")
+                    ).to_value("sec") * 1e3
+                    logger.debug(
+                        f"GPS vs host clock: gps_now={_gps_now} "
+                        f"host_now={Time.now().isot} skew={_skew_ms:+.1f}ms "
+                        f"(positive = system clock ahead of GPS)"
+                    )
+                except Exception as _e:  # diagnostic only, never fatal
+                    logger.debug(f"skew calc failed: {_e}")
                 # Always surface the GPS module status (and last-known position)
                 # via the gpsmetadata endpoint, even when we fall back to the
                 # system clock — lets consumers see LOCKED/LOCKING/SEARCHING/
@@ -763,7 +801,59 @@ class CameraDevice:
                 self._timing["GPS-STAT"] = vsync_status
                 self._timing["GPS-LAT"] = gps.Latitude
                 self._timing["GPS-LON"] = gps.Longitude
-                if vsync_status in ["LOCKED", "LOCKING"] and has_precise_info:
+                self._timing["GPS-SSTAT"] = start_status
+                self._timing["GPS-ESTAT"] = end_status
+                # PPS interval in 10 MHz counts. Nominal 10_000_000; the deviation
+                # is the oscillator error and is a *continuous* lock-quality meter,
+                # unlike the categorical status nibble. An undisciplined TCXO sits
+                # at a stable offset (observed +500 = +50 ppm on 2026-08-28); a
+                # genuinely PPS-locked module should converge toward nominal.
+                self._timing["GPS-PPS"] = gps.PPSDelta
+                self._timing["GPS-PPS-PPM"] = round(
+                    (gps.PPSDelta - 10_000_000) / 10.0, 2
+                )
+                # `_last_exposure_duration` still holds the duration requested in
+                # start_exposure at this point; keep it as the reference for both
+                # validating the latches and for the derived fallback below.
+                requested = self._last_exposure_duration or 0.0
+                # How far apart the Start and End latches actually are. On a
+                # camera that brackets the shutter with them this equals the
+                # exposure; on the QHY174GPS (observed 2026-08-28, GPS LOCKING)
+                # it is a fixed ~20 us regardless of a 0.5/2/5 s request, i.e.
+                # Start, End and Now all report the *frame end*. So the latches
+                # must be validated against the request before being trusted —
+                # using StartSeconds blindly puts an end-of-exposure time in
+                # DATE-OBS, wrong by the whole exposure.
+                latched_span = (gps.EndSeconds - gps.StartSeconds) + (
+                    end_counts - start_counts
+                ) / 1e7
+                self._timing["GPS-SPAN"] = latched_span
+                start_brackets_exposure = (
+                    start_status in ["LOCKED", "LOCKING"]
+                    and gps.StartSeconds > 0
+                    and requested > 0
+                    and abs(latched_span - requested) <= max(0.05 * requested, 0.02)
+                )
+                gps_time_usable = (
+                    vsync_status in ["LOCKED", "LOCKING"] and gps.NowSeconds > 0
+                )
+                if start_brackets_exposure:
+                    # Best case: the module really did latch shutter open/close,
+                    # so we need neither GetQHYCCDPreciseExposureInfo nor the
+                    # rolling-shutter offset (the QHY174 SDK class refuses both).
+                    start_time = gps.create_timestamp(gps.StartSeconds, gps.StartCounts)
+                    end_time = gps.create_timestamp(gps.EndSeconds, gps.EndCounts)
+                    self._timing["DATE-OBS"] = start_time
+                    self._last_exposure_start_time = start_time
+                    self._timing["DATE-END"] = end_time
+                    self._last_exposure_duration = latched_span
+                    self._timing["TIME-SRC"] = "GPS"
+                    self._timing["GPS-SEQN"] = gps.SequenceNumber
+                    logger.debug(
+                        f"GPS timing from shutter latches: start={start_time} "
+                        f"end={end_time} span={latched_span:.6f}s"
+                    )
+                elif vsync_status in ["LOCKED", "LOCKING"] and has_precise_info:
                     end_seconds = (
                         gps.NowSeconds
                         + readout_offset_us_val / 1e6
@@ -786,14 +876,38 @@ class CameraDevice:
                     logger.debug(
                         f"GPS timing: start={start_time}, end={end_time}, status={vsync_status}"
                     )
-                else:
-                    if vsync_status not in ["LOCKED", "LOCKING"]:
-                        logger.warning(f"GPS is {vsync_status}, using system clock")
+                elif gps_time_usable:
+                    # The GPS clock is good (absolute time and a ~10 MHz PPS-locked
+                    # counter) but the shutter latches do not bracket the exposure
+                    # and PreciseExposureInfo is unavailable. The End/Now latch is
+                    # the frame end, so anchor DATE-END to GPS and back out
+                    # DATE-OBS using the requested duration. This is GPS-accurate
+                    # in absolute terms but loses the rolling-shutter correction,
+                    # hence a distinct TIME-SRC so downstream can tell them apart.
+                    if gps.EndSeconds > 0:
+                        end_time = gps.create_timestamp(gps.EndSeconds, gps.EndCounts)
                     else:
-                        logger.warning(
-                            f"GPS {vsync_status} but no precise exposure info "
-                            "(QHY174 SDK class lacks it), using system clock"
-                        )
+                        end_time = gps.create_timestamp(gps.NowSeconds, gps.NowCounts)
+                    start_time = (
+                        Time(end_time, format="isot") - timedelta(seconds=requested)
+                    ).isot
+                    self._timing["DATE-OBS"] = start_time
+                    self._last_exposure_start_time = start_time
+                    self._timing["DATE-END"] = end_time
+                    # Leave _last_exposure_duration at the requested value.
+                    self._timing["TIME-SRC"] = "GPS-DERIVED"
+                    self._timing["GPS-SEQN"] = gps.SequenceNumber
+                    logger.debug(
+                        f"GPS-derived timing: end={end_time} (GPS) minus "
+                        f"requested {requested}s -> start={start_time}; "
+                        f"latch span was {latched_span:.6f}s"
+                    )
+                else:
+                    logger.warning(
+                        f"No GPS timing available (start latch={start_status} "
+                        f"ssec={gps.StartSeconds}, now={vsync_status}, "
+                        f"precise_info={has_precise_info}); using system clock"
+                    )
                     self._use_system_clock_timing()
             except Exception as e:
                 logger.warning(f"GPS parsing failed: {e}, using system clock")
