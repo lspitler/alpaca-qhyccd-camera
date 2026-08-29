@@ -24,6 +24,18 @@ from log import get_logger
 logger = get_logger()
 
 
+# Which GPS module statuses are trustworthy enough to timestamp science frames.
+#
+# Deliberately excludes LOCKING. The status nibble reports LOCKING even with the
+# antenna fully disconnected, and on jetson008 (2026-08-28/29) a module stuck in
+# LOCKING produced absolute times 520-806 ms wrong while reporting lat/lon 0.0 and
+# a bit-for-bit frozen PPS register. Tagging that as GPS provenance is worse than
+# honestly falling back to the system clock, because a downstream consumer cannot
+# tell it apart from a real fix. GPS-STAT/GPS-PPS are still published on every
+# frame regardless, so lock progress remains observable.
+GPS_TRUSTED_STATUSES = ("LOCKED",)
+
+
 class CameraState(IntEnum):
     IDLE = 0
     WAITING = 1
@@ -829,13 +841,13 @@ class CameraDevice:
                 ) / 1e7
                 self._timing["GPS-SPAN"] = latched_span
                 start_brackets_exposure = (
-                    start_status in ["LOCKED", "LOCKING"]
+                    start_status in GPS_TRUSTED_STATUSES
                     and gps.StartSeconds > 0
                     and requested > 0
                     and abs(latched_span - requested) <= max(0.05 * requested, 0.02)
                 )
                 gps_time_usable = (
-                    vsync_status in ["LOCKED", "LOCKING"] and gps.NowSeconds > 0
+                    vsync_status in GPS_TRUSTED_STATUSES and gps.NowSeconds > 0
                 )
                 if start_brackets_exposure:
                     # Best case: the module really did latch shutter open/close,
@@ -853,7 +865,7 @@ class CameraDevice:
                         f"GPS timing from shutter latches: start={start_time} "
                         f"end={end_time} span={latched_span:.6f}s"
                     )
-                elif vsync_status in ["LOCKED", "LOCKING"] and has_precise_info:
+                elif vsync_status in GPS_TRUSTED_STATUSES and has_precise_info:
                     end_seconds = (
                         gps.NowSeconds
                         + readout_offset_us_val / 1e6
@@ -904,9 +916,11 @@ class CameraDevice:
                     )
                 else:
                     logger.warning(
-                        f"No GPS timing available (start latch={start_status} "
+                        f"No trusted GPS timing (start latch={start_status} "
                         f"ssec={gps.StartSeconds}, now={vsync_status}, "
-                        f"precise_info={has_precise_info}); using system clock"
+                        f"precise_info={has_precise_info}, "
+                        f"pps_ppm={self._timing.get('GPS-PPS-PPM')}); "
+                        f"need status in {GPS_TRUSTED_STATUSES} — using system clock"
                     )
                     self._use_system_clock_timing()
             except Exception as e:
@@ -1261,6 +1275,16 @@ class CameraDevice:
 
         # Record start time (may be overwritten by GPS metadata)
         self._last_exposure_duration = duration
+        # Drop the previous frame's timing so nothing stale can be published.
+        # _timing is otherwise only cleared on disconnect, so without this a
+        # frame whose GPS parse fails would keep the *previous* frame's
+        # GPS-STAT/GPS-PPS alongside a fresh system-clock DATE-OBS — which is
+        # exactly the false provenance this timing path is meant to avoid.
+        for _stale in [k for k in self._timing if k.startswith("GPS-")] + [
+            "DATE-END",
+            "TIME-SRC",
+        ]:
+            self._timing.pop(_stale, None)
         self._timing["DATE-OBS"] = Time.now().isot
         self._last_exposure_start_time = self._timing["DATE-OBS"]
 
