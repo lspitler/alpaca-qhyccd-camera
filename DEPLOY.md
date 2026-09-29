@@ -441,6 +441,18 @@ from a marginal spot. Fibreglass domes are fine.
 5800 accepting TCP, HTTP never responding, logs frozen — a blocking call stuck in
 libqhyccd/USB. Docker reports the container healthy throughout, and a downstream
 sensorkit Alpaca service crash-looped on it. `docker restart` clears it instantly.
+
+**A second, harder wedge lives in the camera itself.** Signature: connect,
+`StartExposure` and `ImageReady` all succeed, but every `imagearray` hangs inside
+`GetQHYCCDSingleFrame` and `docker restart` does **not** help. `dmesg` shows a
+`usb 2-3: USB disconnect` that re-enumerated straight to `1618:c175` *without* the
+`1618:c174` bootloader (Cypress "WestBridge") appearing first — the data link
+glitched but the camera kept 5 V, so its FX3 firmware stayed in a bad state. Seen
+on jetson008 after a host reboot (2026-08-29) and after the USB cable was
+disturbed on site (2026-09-29). Host reboots, `USBDEVFS_RESET` and unplugging the
+12 V (TEC only) do not fix it. **Unplugging the camera's USB cable for ~30 s does**:
+confirm `c174` appears in `dmesg` before `c175`, then `docker restart`. The GPS
+receiver cold-starts too, so expect `LOCKING` for a minute or more afterwards.
 A watchdog on this box automates the recovery; if the target machine is
 unattended, port it:
 

@@ -386,8 +386,9 @@ requirements are `GLIBC_2.14` and `GLIBCXX_3.4.21`, so bind-mounting the host's
 | Filter positions read wrong | Slot count (`len(names)`) doesn't match the wheel — the position decoder uses it to disambiguate byte vs ASCII encoding |
 | Pixel values ~16× too high | `sensor_bpp` not set for a sub-16-bit sensor |
 | Server accepts TCP but never answers HTTP; logs frozen | A blocking call wedged inside libqhyccd/USB. Restart the process/container; see `DEPLOY.md` for a watchdog |
+| Every `imagearray` hangs and a container restart doesn't help | Camera firmware wedged after a USB glitch that kept 5 V up. Unplug the camera USB ~30 s (look for `1618:c174` in `dmesg`), then restart — see `DEPLOY.md` §6 |
 | GPS precise timing unavailable on QHY174 | Settled and not fixable — the SDK's QHY174 class never overrides the timing calls. With a `LOCKED` fix the driver uses `TIME-SRC=GPS-DERIVED` instead; do not re-debug the SDK calls |
-| `GPS-STAT` stuck at `LOCKING`, lat/lon `0.0`, `GPS-PPS` frozen at `10000500` | **No usable antenna signal** — not a driver or camera fault. Check the SMA is seated (the camera supplies ~3.3 V antenna bias on the centre pin) and, above all, **placement**: an antenna with part of the sky blocked (telescope, monitors) can *hold* a lock it already has but never *acquire* one. `LOCKED` persisting after a move proves nothing — only a fresh acquisition does. Cold acquisition takes ~5 min with a clear view |
+| `GPS-STAT` stuck at `LOCKING`, lat/lon `0.0`, `GPS-PPS` frozen at `10000500` | **No usable antenna signal** — not a driver or camera fault. Check the SMA is seated (the camera supplies ~3.3 V antenna bias on the centre pin) and, above all, **placement**: an antenna with part of the sky blocked (telescope, monitors) can *hold* a lock it already has but never *acquire* one. `LOCKED` persisting after a move proves nothing — only a fresh acquisition does. Cold acquisition took 1–5 min with a clear view |
 | `GPS-LON` about 100° too small (e.g. 49 instead of 149) | Fixed — older builds dropped the hundreds digit of longitude. Rebuild the image |
 
 ---
