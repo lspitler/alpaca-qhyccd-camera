@@ -82,6 +82,11 @@ class QHY_GPS(Structure):
     def create_status(cls, flag):
         return ['OFFLINE', 'SEARCHING', 'LOCKING', 'LOCKED'][(flag // 16) % 4]
 
+    # Position is packed as decimal digits: a sign flag at 1e9 (set = south/west),
+    # then degrees and decimal minutes. Latitude is DD MM.MMMMM (degrees at 1e7);
+    # longitude is DDD MM.MMMM (degrees at 1e6) and needs THREE degree digits —
+    # taking them modulo 100 dropped the hundreds and reported Siding Spring
+    # (149.06 E) as 49.06. The modulus also strips the sign flag.
     @property
     def Latitude(self):
         minutes = (self._Latitude % 10000000) / 100000
@@ -92,7 +97,7 @@ class QHY_GPS(Structure):
     @property
     def Longitude(self):
         minutes = (self._Longitude % 1000000) / 10000
-        degrees = (self._Longitude // 1000000) % 100
+        degrees = (self._Longitude // 1000000) % 1000
         sign = -1 if self._Longitude > 1000000000 else 1
         return sign * (degrees + minutes / 60)
 
