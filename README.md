@@ -13,7 +13,7 @@ Hardware tested:
 | Device | Notes |
 |---|---|
 | QHY600M | USB only (no PCIe support) |
-| QHY174GPS | Requires `sensor_bpp: 12`; precise GPS timing is unavailable in the SDK for this model (falls back to system clock) |
+| QHY174GPS | Requires `sensor_bpp: 12`; precise (rolling-shutter) GPS timing is unavailable in the SDK for this model — with a `LOCKED` fix, times are GPS-derived (see `gpsmetadata` below) |
 | QHY CFW3 | Via 4-pin CFW cable to the camera, **not** a separate USB/serial wheel |
 
 > **Deploying to a new machine?** `DEPLOY.md` is the step-by-step,
@@ -89,7 +89,21 @@ Hardware tested:
 immediately and the client polls `ImageReady`.
 
 Beyond the standard interface, `GET /api/v1/camera/{n}/gpsmetadata` returns the
-per-frame GPS status for GPS-capable cameras.
+per-frame GPS status for GPS-capable cameras. It is populated when the frame is
+**fetched** (`imagearray`), so read it after the download, not just after
+`imageready`.
+
+| Key | Meaning |
+|---|---|
+| `TIME-SRC` | Provenance of `DATE-OBS`/`DATE-END`: `GPS` (shutter latches bracket the exposure), `GPS-DERIVED` (end latch from GPS, start backed out by the requested duration — the QHY174GPS case), or `SYSCLOCK` |
+| `GPS-STAT` / `GPS-SSTAT` / `GPS-ESTAT` | Module status (`OFFLINE`/`SEARCHING`/`LOCKING`/`LOCKED`). Only **`LOCKED`** earns a GPS `TIME-SRC`; anything else falls back to `SYSCLOCK` |
+| `GPS-LAT` / `GPS-LON` | Decimal degrees, south/west negative. `0.0` until a fix |
+| `GPS-PPS` / `GPS-PPS-PPM` | PPS interval in 10 MHz counts, and its deviation from nominal. A reading that varies frame to frame means PPS edges are arriving; **bit-for-bit constant `10000500` means no PPS** (no antenna signal) |
+| `GPS-SPAN` | End−Start latch span in seconds; gates the `GPS` tier |
+| `GPS-SEQN` | Module sequence number (proves the struct is refreshing) |
+
+The status nibble alone is not trustworthy: it reports `LOCKING` even with the
+antenna unplugged. See Troubleshooting for the no-lock signature.
 
 ## Implemented IFilterWheelV3 capabilities
 
@@ -372,7 +386,9 @@ requirements are `GLIBC_2.14` and `GLIBCXX_3.4.21`, so bind-mounting the host's
 | Filter positions read wrong | Slot count (`len(names)`) doesn't match the wheel — the position decoder uses it to disambiguate byte vs ASCII encoding |
 | Pixel values ~16× too high | `sensor_bpp` not set for a sub-16-bit sensor |
 | Server accepts TCP but never answers HTTP; logs frozen | A blocking call wedged inside libqhyccd/USB. Restart the process/container; see `DEPLOY.md` for a watchdog |
-| GPS precise timing unavailable on QHY174 | Settled and not fixable — the SDK's QHY174 class never overrides the timing calls. Falls back to system clock. Do not re-debug |
+| GPS precise timing unavailable on QHY174 | Settled and not fixable — the SDK's QHY174 class never overrides the timing calls. With a `LOCKED` fix the driver uses `TIME-SRC=GPS-DERIVED` instead; do not re-debug the SDK calls |
+| `GPS-STAT` stuck at `LOCKING`, lat/lon `0.0`, `GPS-PPS` frozen at `10000500` | **No usable antenna signal** — not a driver or camera fault. Check the SMA is seated (the camera supplies ~3.3 V antenna bias on the centre pin) and, above all, **placement**: an antenna with part of the sky blocked (telescope, monitors) can *hold* a lock it already has but never *acquire* one. `LOCKED` persisting after a move proves nothing — only a fresh acquisition does. Cold acquisition takes ~5 min with a clear view |
+| `GPS-LON` about 100° too small (e.g. 49 instead of 149) | Fixed — older builds dropped the hundreds digit of longitude. Rebuild the image |
 
 ---
 

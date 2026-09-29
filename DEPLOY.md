@@ -373,6 +373,7 @@ tarball (they target port 5900 — edit if you use 5800):
 - `~/Downloads/test-filterwheel.bash` — full camera-then-wheel connect and a move
 - `~/Downloads/test_qhy_nogps.py` — asserts the `TIME-SRC: SYSCLOCK` fallback
 - `python tests/test.py` in-repo — connect, expose, write FITS
+- `python tests/test_gps_decode.py` in-repo — offline GPS lat/lon decode check (no camera needed)
 - `python tests/test_conformu.py` in-repo — ASCOM ConformU validation
   (`~/Downloads/conformu.linux-x64.tar.xz` is the runner)
 
@@ -412,15 +413,29 @@ position before the wheel physically starts. It sleeps 0.3 s first and then poll
 to `timeout` (60 s). A wheel that is slower than `timeout` needs the config bumped,
 not a code change.
 
-**GPS precise timing is not available on the QHY174 — this is settled, do not
+**GPS *precise* timing is not available on the QHY174 — this is settled, do not
 re-debug it.** `GetQHYCCDPreciseExposureInfo` and
 `GetQHYCCDRollingShutterEndOffset` log "not supported" and always will. Root cause
 confirmed 2026-06-29 by symbol scan: the SDK is class-based, and the QHY174's
 class never overrides them — only the weak `QHYBASE` stubs exist. It is **not** a
 firmware-revision problem and **not** fixable by a different build of this SDK
-version. Timestamps fall back to `TIME-SRC: SYSCLOCK`. Full analysis in
-`/opt/firefly/CAMERA_GPS_TIMING.md`. This does not block imaging — do not gate a
-collect on GPS timing.
+version. The driver no longer needs them: with a `LOCKED` fix it anchors
+`DATE-END` to the GPS end latch and backs `DATE-OBS` out by the requested
+duration (`TIME-SRC: GPS-DERIVED`). Without a lock, timestamps fall back to
+`TIME-SRC: SYSCLOCK`. Full analysis in `/opt/firefly/CAMERA_GPS_TIMING.md`. This
+does not block imaging — do not gate a collect on GPS timing.
+
+**No GPS lock is almost always the antenna, and usually its placement.** The
+no-signal signature is `GPS-STAT: LOCKING`, lat/lon `0.0`, and `GPS-PPS`
+bit-for-bit `10000500` on every frame; it survives container restarts and full
+power cycles, because it is not a software state. On jetson008 (2026-09-29) an
+antenna mid-dome, with the telescope and a monitor blocking parts of the sky,
+never acquired in a month yet *held* a lock handed to it; moved to a clearer
+spot, the same antenna locked. Checks, cheapest first: DC on the camera SMA
+centre pin (~3.3 V = antenna bias present), plug seated and standard SMA (not
+RP-SMA), then placement. Verify with a **fresh** acquisition (unplug, replug,
+wait ~5–10 min) — a module that is already locked will keep reporting `LOCKED`
+from a marginal spot. Fibreglass domes are fine.
 
 **The server can wedge inside the SDK.** Observed: container `Up 12 hours`, port
 5800 accepting TCP, HTTP never responding, logs frozen — a blocking call stuck in
