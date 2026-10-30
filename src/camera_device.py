@@ -9,7 +9,8 @@ from ctypes import (
 )
 from datetime import datetime, timedelta, timezone
 from enum import IntEnum
-from threading import Event, Lock, Thread
+import queue
+from threading import Event, Lock, Thread, current_thread
 import time
 from typing import Dict, List, Optional
 
@@ -54,6 +55,141 @@ class SensorType(IntEnum):
     LRGB = 5
 
 
+# States in which an exposure owns the SDK (see SdkWorker).
+EXPOSURE_STATES = (
+    CameraState.WAITING,
+    CameraState.EXPOSING,
+    CameraState.READING,
+    CameraState.DOWNLOADING,
+)
+
+
+class SdkWedgedError(RuntimeError):
+    """An SDK call never returned; the camera needs a power cycle."""
+
+
+class _SdkJob:
+    def __init__(self, fn, args):
+        self.fn = fn
+        self.args = args
+        self.started = False
+        self.cancelled = False
+        self.done = Event()
+        self.result = None
+        self.error: Optional[BaseException] = None
+
+
+class SdkWorker:
+    """Runs libqhyccd calls on one dedicated thread, one at a time.
+
+    The QHY SDK is not safe to drive from several threads: GetQHYCCDSingleFrame can
+    block forever unless it runs on the thread that called ExpQHYCCDSingleFrame, and
+    other calls made during an exposure or readout can hang it
+    (open-astro/AlpacaBridge .github/instructions/qhy.instructions.md). Before this
+    the driver called the SDK from the HTTP event loop, a new thread per exposure,
+    the connect thread and the filter-wheel poll thread.
+
+    The SDK has no timeouts of its own. A call that overruns its timeout is left
+    running (a thread stuck in C can't be stopped) and the worker is marked wedged:
+    every later call fails at once with SdkWedgedError instead of queueing behind
+    it. Only a camera power cycle and a driver restart clear that.
+    """
+
+    def __init__(self, name: str):
+        self._name = name
+        self._queue: queue.Queue[_SdkJob] = queue.Queue()
+        self._lock = Lock()
+        self.wedged: Optional[str] = None
+        # Name of the SDK function the worker is inside, for the wedge message.
+        self.current: Optional[str] = None
+        self._thread = Thread(target=self._loop, name=f"sdk-{name}", daemon=True)
+        self._thread.start()
+
+    def _loop(self) -> None:
+        while True:
+            job = self._queue.get()
+            with self._lock:
+                if job.cancelled:
+                    continue
+                job.started = True
+            try:
+                job.result = self._run(job.fn, job.args)
+            except BaseException as e:
+                job.error = e
+            finally:
+                job.done.set()
+
+    def _run(self, fn, args):
+        outer = self.current
+        self.current = getattr(fn, "__name__", repr(fn))
+        try:
+            return fn(*args)
+        finally:
+            self.current = outer
+
+    def check(self) -> None:
+        if self.wedged:
+            raise SdkWedgedError(self.wedged)
+
+    def call(self, fn, *args, timeout: float):
+        """Run fn(*args) on the worker and return its result.
+
+        `timeout` bounds the wait for the worker to be free (overrunning it drops the
+        call and raises TimeoutError) and then the call itself (overrunning that marks
+        the worker wedged). Calls made from the worker thread run directly.
+        """
+        if current_thread() is self._thread:
+            return self._run(fn, args)
+        self.check()
+        name = getattr(fn, "__name__", repr(fn))
+        job = _SdkJob(fn, args)
+        self._queue.put(job)
+        start_deadline = time.monotonic() + timeout
+        while not job.done.wait(0.2):
+            with self._lock:
+                if job.started:
+                    break
+                if self.wedged or time.monotonic() >= start_deadline:
+                    job.cancelled = True
+            if job.cancelled:
+                self.check()
+                raise TimeoutError(f"SDK busy: {name} could not start within {timeout:.0f}s")
+        if not job.done.wait(timeout):
+            stuck = self.current or name
+            self.wedged = (
+                f"{stuck} did not return within {timeout:.0f}s; "
+                "the camera needs a power cycle and a driver restart"
+            )
+            logger.error(f"{self._name}: {self.wedged}")
+            raise SdkWedgedError(self.wedged)
+        if job.error is not None:
+            raise job.error
+        return job.result
+
+
+class SerializedLibrary:
+    """The loaded libqhyccd, with every function call routed through an SdkWorker.
+
+    `raw` is the underlying CDLL, for declaring ctypes signatures and for the one
+    call that must bypass the worker (CancelQHYCCDExposingAndReadout).
+    """
+
+    def __init__(self, lib, worker: SdkWorker, timeout: float):
+        self.raw = lib
+        self._worker = worker
+        self._timeout = timeout
+
+    def __getattr__(self, name: str):
+        fn = getattr(self.raw, name)
+        worker, timeout = self._worker, self._timeout
+
+        def call(*args):
+            return worker.call(fn, *args, timeout=timeout)
+
+        call.__name__ = name
+        return call
+
+
 class CameraDevice:
     """Low-level driver for the QHYCCD camera (libqhyccd)."""
 
@@ -65,6 +201,9 @@ class CameraDevice:
 
         self.libqhyccd = None
         self.handle = None
+        self._sdk = SdkWorker(device_config.entity)
+        # Last-read parameter values, served while an exposure owns the SDK.
+        self._param_cache: Dict[int, float] = {}
 
         self._connected = False
         self._connecting = False
@@ -75,6 +214,10 @@ class CameraDevice:
         self._cached_image: Optional[np.ndarray] = None
         self._exposure_complete = Event()
         self._readout_complete = Event()
+        self._abort_requested = Event()
+        # Bumped per exposure, so a finished or aborted one can't touch the state of
+        # the exposure that replaced it.
+        self._exposure_seq = 0
 
         self._last_exposure_duration: Optional[float] = None
         self._last_exposure_start_time: Optional[str] = None
@@ -134,7 +277,11 @@ class CameraDevice:
         try:
             # Load the library
             if self.libqhyccd is None:
-                self.libqhyccd = load_qhyccd_library(self._library_path)
+                self.libqhyccd = SerializedLibrary(
+                    load_qhyccd_library(self._library_path),
+                    self._sdk,
+                    self._config.sdk_timeout,
+                )
 
             # Initialize resources
             res = self.libqhyccd.InitQHYCCDResource()
@@ -208,6 +355,8 @@ class CameraDevice:
 
             # Set remaining default parameters (temperature, gain, offset, binning, etc.)
             self._set_default_parameters()
+
+            self._seed_param_cache()
 
             # Use camera model as sensor name
             self._sensor_name = self._camera_model
@@ -530,10 +679,15 @@ class CameraDevice:
         if not self._connected:
             return
         try:
-            if self._camera_state in (CameraState.EXPOSING, CameraState.READING):
+            if self.exposure_in_progress:
                 self.abort_exposure()
             if self.handle is not None:
+                # Queued behind any readout still running, so the handle is never
+                # closed under a live transfer. Fails at once if the SDK is wedged.
                 self.libqhyccd.CloseQHYCCD(self.handle)
+        except Exception as e:
+            logger.error(f"Disconnect error: {e}")
+        try:
             self._connected = False
             self._camera_state = CameraState.IDLE
             # Reset all session state so reconnect starts fresh
@@ -548,6 +702,7 @@ class CameraDevice:
             self._start_y = 0
             self._num_x = 0
             self._num_y = 0
+            self._param_cache = {}
             self.handle = None
             logger.info(f"Disconnected from camera {self._config.entity}")
         except Exception as e:
@@ -569,6 +724,7 @@ class CameraDevice:
         if value < 1 or value > self._max_bin_x:
             raise ValueError(f"BinX {value} not in range 1-{self._max_bin_x}")
         if value != self._bin_x:
+            self._require_no_exposure()
             self._set_roi(bin_x=value, bin_y=value)
 
     @property
@@ -580,6 +736,7 @@ class CameraDevice:
         if value < 1 or value > self._max_bin_y:
             raise ValueError(f"BinX {value} not in range 1-{self._max_bin_y}")
         if value != self._bin_y:
+            self._require_no_exposure()
             self._set_roi(bin_x=value, bin_y=value)
 
     @property
@@ -624,18 +781,15 @@ class CameraDevice:
 
     @property
     def ccd_temperature(self) -> float:
-        val = self.libqhyccd.GetQHYCCDParam(self.handle, QHY_CONTROL.CURTEMP)
-        return val
+        return self._read_param(QHY_CONTROL.CURTEMP)
 
     @property
     def cooler_on(self) -> bool:
-        val = self.libqhyccd.GetQHYCCDParam(self.handle, QHY_CONTROL.CURPWM)
-        return val > 0
+        return self._read_param(QHY_CONTROL.CURPWM) > 0
 
     @property
     def cooler_power(self) -> float:
-        val = self.libqhyccd.GetQHYCCDParam(self.handle, QHY_CONTROL.CURPWM)
-        return val / 255.0 * 100.0
+        return self._read_param(QHY_CONTROL.CURPWM) / 255.0 * 100.0
 
     @property
     def exposure_max(self) -> float:
@@ -655,11 +809,11 @@ class CameraDevice:
 
     @property
     def gain(self) -> int:
-        val = self.libqhyccd.GetQHYCCDParam(self.handle, QHY_CONTROL.GAIN)
-        return int(val)
+        return int(self._read_param(QHY_CONTROL.GAIN))
 
     @gain.setter
     def gain(self, value: int) -> None:
+        self._require_no_exposure()
         res = self.libqhyccd.SetQHYCCDParam(
             self.handle, QHY_CONTROL.GAIN, c_double(float(value))
         )
@@ -680,17 +834,22 @@ class CameraDevice:
 
     @property
     def image_array(self) -> np.ndarray:
-        """Returns a 2D numpy array of the last captured image."""
-        if not self._image_ready:
+        """Returns a 2D numpy array of the last captured image.
+
+        The frame was already read out on the SDK worker by _run_exposure, so this
+        never touches the SDK. The image stays available until the next exposure
+        starts (ASCOM spec).
+        """
+        if not self._image_ready or self._cached_image is None:
             raise RuntimeError("No image ready")
+        return self._cached_image
 
-        # Return cached image if already read (ASCOM spec: image stays available
-        # until the next exposure starts)
-        if self._cached_image is not None:
-            return self._cached_image
+    def _read_frame(self) -> np.ndarray:
+        """Read the exposed frame out of the SDK and parse its GPS timing.
 
-        self._camera_state = CameraState.DOWNLOADING
-
+        Runs on the SDK worker, straight after ExpQHYCCDSingleFrame and on the same
+        thread, which GetQHYCCDSingleFrame needs.
+        """
         # Get current ROI from camera
         roi_sx = c_uint32()
         roi_sy = c_uint32()
@@ -753,7 +912,6 @@ class CameraDevice:
             self.handle, byref(img_w), byref(img_h), byref(bpp), byref(channels), data
         )
         if res != QHY_SUCCESS:
-            self._camera_state = CameraState.ERROR
             raise RuntimeError("GetQHYCCDSingleFrame failed")
 
         # Parse GPS timing information from the raw row-major buffer before
@@ -765,167 +923,10 @@ class CameraDevice:
         if not self._has_gps:
             self._use_system_clock_timing()
         else:
-            try:
-                gps = QHY_GPS.from_address(addressof(data))
-                vsync_status = gps.create_status(gps.NowFlag)
-                start_status = gps.create_status(gps.StartFlag)
-                end_status = gps.create_status(gps.EndFlag)
-                start_counts = int.from_bytes(bytes(gps.StartCounts), "big")
-                end_counts = int.from_bytes(bytes(gps.EndCounts), "big")
-                now_counts = int.from_bytes(bytes(gps.NowCounts), "big")
-                # DIAGNOSTIC: dump every field of the GPS struct. ImageWidth and
-                # ImageHeight should match the sensor (1920x1200 on a QHY174) —
-                # if they do not, the struct is mis-aligned against the frame
-                # buffer and every other field here is meaningless.
-                logger.debug(
-                    f"GPS raw: seq={gps.SequenceNumber} w={gps.ImageWidth} "
-                    f"h={gps.ImageHeight} | start={start_status}(flag={gps.StartFlag}) "
-                    f"ssec={gps.StartSeconds} scnt={start_counts} "
-                    f"| end={end_status}(flag={gps.EndFlag}) "
-                    f"esec={gps.EndSeconds} ecnt={end_counts} "
-                    f"| now={vsync_status}(flag={gps.NowFlag}) "
-                    f"nsec={gps.NowSeconds} ncnt={now_counts} "
-                    f"| pps={gps.PPSDelta} lat={gps.Latitude} lon={gps.Longitude} "
-                    f"| d_sec={gps.EndSeconds - gps.StartSeconds} "
-                    f"d_cnt={end_counts - start_counts}"
-                )
-                # Host-vs-GPS clock skew, measured at the same instant: the Now
-                # latch is the frame end and we read the system clock immediately
-                # after fetching that frame, so the difference is the system
-                # clock error plus a sub-ms readout delay. This is the number
-                # that justifies GPS timing at all.
-                try:
-                    _gps_now = gps.create_timestamp(gps.NowSeconds, gps.NowCounts)
-                    _skew_ms = (
-                        Time.now() - Time(_gps_now, format="isot")
-                    ).to_value("sec") * 1e3
-                    logger.debug(
-                        f"GPS vs host clock: gps_now={_gps_now} "
-                        f"host_now={Time.now().isot} skew={_skew_ms:+.1f}ms "
-                        f"(positive = system clock ahead of GPS)"
-                    )
-                except Exception as _e:  # diagnostic only, never fatal
-                    logger.debug(f"skew calc failed: {_e}")
-                # Always surface the GPS module status (and last-known position)
-                # via the gpsmetadata endpoint, even when we fall back to the
-                # system clock — lets consumers see LOCKED/LOCKING/SEARCHING/
-                # OFFLINE per frame.
-                self._timing["GPS-STAT"] = vsync_status
-                self._timing["GPS-LAT"] = gps.Latitude
-                self._timing["GPS-LON"] = gps.Longitude
-                self._timing["GPS-SSTAT"] = start_status
-                self._timing["GPS-ESTAT"] = end_status
-                # PPS interval in 10 MHz counts. Nominal 10_000_000; the deviation
-                # is the oscillator error and is a *continuous* lock-quality meter,
-                # unlike the categorical status nibble. An undisciplined TCXO sits
-                # at a stable offset (observed +500 = +50 ppm on 2026-08-28); a
-                # genuinely PPS-locked module should converge toward nominal.
-                self._timing["GPS-PPS"] = gps.PPSDelta
-                self._timing["GPS-PPS-PPM"] = round(
-                    (gps.PPSDelta - 10_000_000) / 10.0, 2
-                )
-                # `_last_exposure_duration` still holds the duration requested in
-                # start_exposure at this point; keep it as the reference for both
-                # validating the latches and for the derived fallback below.
-                requested = self._last_exposure_duration or 0.0
-                # How far apart the Start and End latches actually are. On a
-                # camera that brackets the shutter with them this equals the
-                # exposure; on the QHY174GPS (observed 2026-08-28, GPS LOCKING)
-                # it is a fixed ~20 us regardless of a 0.5/2/5 s request, i.e.
-                # Start, End and Now all report the *frame end*. So the latches
-                # must be validated against the request before being trusted —
-                # using StartSeconds blindly puts an end-of-exposure time in
-                # DATE-OBS, wrong by the whole exposure.
-                latched_span = (gps.EndSeconds - gps.StartSeconds) + (
-                    end_counts - start_counts
-                ) / 1e7
-                self._timing["GPS-SPAN"] = latched_span
-                start_brackets_exposure = (
-                    start_status in GPS_TRUSTED_STATUSES
-                    and gps.StartSeconds > 0
-                    and requested > 0
-                    and abs(latched_span - requested) <= max(0.05 * requested, 0.02)
-                )
-                gps_time_usable = (
-                    vsync_status in GPS_TRUSTED_STATUSES and gps.NowSeconds > 0
-                )
-                if start_brackets_exposure:
-                    # Best case: the module really did latch shutter open/close,
-                    # so we need neither GetQHYCCDPreciseExposureInfo nor the
-                    # rolling-shutter offset (the QHY174 SDK class refuses both).
-                    start_time = gps.create_timestamp(gps.StartSeconds, gps.StartCounts)
-                    end_time = gps.create_timestamp(gps.EndSeconds, gps.EndCounts)
-                    self._timing["DATE-OBS"] = start_time
-                    self._last_exposure_start_time = start_time
-                    self._timing["DATE-END"] = end_time
-                    self._last_exposure_duration = latched_span
-                    self._timing["TIME-SRC"] = "GPS"
-                    self._timing["GPS-SEQN"] = gps.SequenceNumber
-                    logger.debug(
-                        f"GPS timing from shutter latches: start={start_time} "
-                        f"end={end_time} span={latched_span:.6f}s"
-                    )
-                elif vsync_status in GPS_TRUSTED_STATUSES and has_precise_info:
-                    end_seconds = (
-                        gps.NowSeconds
-                        + readout_offset_us_val / 1e6
-                        + line_period_ns.value / 1e9 * 2 * (roi_sy.value // 2)
-                    )
-                    start_time = gps.create_timestamp(
-                        end_seconds - actual_exposure_us.value / 1e6, gps.NowCounts
-                    )
-                    end_time = gps.create_timestamp(end_seconds, gps.NowCounts)
-                    self._timing["DATE-OBS"] = start_time
-                    self._last_exposure_start_time = start_time
-                    self._timing["DATE-END"] = end_time
-                    self._last_exposure_duration = (
-                        Time(end_time, format="isot") - Time(start_time, format="isot")
-                    ).to_value("sec")
-                    self._timing["TIME-SRC"] = "GPS"
-                    self._timing["GPS-SEQN"] = gps.SequenceNumber
-                    self._timing["GPS-LAT"] = gps.Latitude
-                    self._timing["GPS-LON"] = gps.Longitude
-                    logger.debug(
-                        f"GPS timing: start={start_time}, end={end_time}, status={vsync_status}"
-                    )
-                elif gps_time_usable:
-                    # The GPS clock is good (absolute time and a ~10 MHz PPS-locked
-                    # counter) but the shutter latches do not bracket the exposure
-                    # and PreciseExposureInfo is unavailable. The End/Now latch is
-                    # the frame end, so anchor DATE-END to GPS and back out
-                    # DATE-OBS using the requested duration. This is GPS-accurate
-                    # in absolute terms but loses the rolling-shutter correction,
-                    # hence a distinct TIME-SRC so downstream can tell them apart.
-                    if gps.EndSeconds > 0:
-                        end_time = gps.create_timestamp(gps.EndSeconds, gps.EndCounts)
-                    else:
-                        end_time = gps.create_timestamp(gps.NowSeconds, gps.NowCounts)
-                    start_time = (
-                        Time(end_time, format="isot") - timedelta(seconds=requested)
-                    ).isot
-                    self._timing["DATE-OBS"] = start_time
-                    self._last_exposure_start_time = start_time
-                    self._timing["DATE-END"] = end_time
-                    # Leave _last_exposure_duration at the requested value.
-                    self._timing["TIME-SRC"] = "GPS-DERIVED"
-                    self._timing["GPS-SEQN"] = gps.SequenceNumber
-                    logger.debug(
-                        f"GPS-derived timing: end={end_time} (GPS) minus "
-                        f"requested {requested}s -> start={start_time}; "
-                        f"latch span was {latched_span:.6f}s"
-                    )
-                else:
-                    logger.warning(
-                        f"No trusted GPS timing (start latch={start_status} "
-                        f"ssec={gps.StartSeconds}, now={vsync_status}, "
-                        f"precise_info={has_precise_info}, "
-                        f"pps_ppm={self._timing.get('GPS-PPS-PPM')}); "
-                        f"need status in {GPS_TRUSTED_STATUSES} — using system clock"
-                    )
-                    self._use_system_clock_timing()
-            except Exception as e:
-                logger.warning(f"GPS parsing failed: {e}, using system clock")
-                self._use_system_clock_timing()
+            self._parse_gps_timing(
+                data, has_precise_info, readout_offset_us_val,
+                line_period_ns, actual_exposure_us, roi_sy,
+            )
 
         # Build the ASCOM-shaped image: native buffer is row-major (H, W);
         # ASCOM ImageArray indexes as [x, y] so we transpose to (W, H).
@@ -944,11 +945,180 @@ class CameraDevice:
             >> shift
         )
 
-        self._camera_state = CameraState.IDLE
-        self._cached_image = img
-
         logger.debug(f"Image: {img.shape[0]}x{img.shape[1]}, dtype={img.dtype}")
         return img
+
+    def _parse_gps_timing(
+        self, data, has_precise_info, readout_offset_us, line_period_ns,
+        actual_exposure_us, roi_sy,
+    ) -> None:
+        """Fill DATE-OBS/DATE-END/TIME-SRC and GPS-* from the GPS struct.
+
+        The struct sits in the first bytes of the raw frame buffer, so this runs
+        before the buffer is reshaped. Falls back to the system clock when no GPS
+        status is trusted or the struct doesn't parse.
+        """
+        try:
+            gps = QHY_GPS.from_address(addressof(data))
+            vsync_status = gps.create_status(gps.NowFlag)
+            start_status = gps.create_status(gps.StartFlag)
+            end_status = gps.create_status(gps.EndFlag)
+            start_counts = int.from_bytes(bytes(gps.StartCounts), "big")
+            end_counts = int.from_bytes(bytes(gps.EndCounts), "big")
+            now_counts = int.from_bytes(bytes(gps.NowCounts), "big")
+            # DIAGNOSTIC: dump every field of the GPS struct. ImageWidth and
+            # ImageHeight should match the sensor (1920x1200 on a QHY174) —
+            # if they do not, the struct is mis-aligned against the frame
+            # buffer and every other field here is meaningless.
+            logger.debug(
+                f"GPS raw: seq={gps.SequenceNumber} w={gps.ImageWidth} "
+                f"h={gps.ImageHeight} | start={start_status}(flag={gps.StartFlag}) "
+                f"ssec={gps.StartSeconds} scnt={start_counts} "
+                f"| end={end_status}(flag={gps.EndFlag}) "
+                f"esec={gps.EndSeconds} ecnt={end_counts} "
+                f"| now={vsync_status}(flag={gps.NowFlag}) "
+                f"nsec={gps.NowSeconds} ncnt={now_counts} "
+                f"| pps={gps.PPSDelta} lat={gps.Latitude} lon={gps.Longitude} "
+                f"| d_sec={gps.EndSeconds - gps.StartSeconds} "
+                f"d_cnt={end_counts - start_counts}"
+            )
+            # Host-vs-GPS clock skew, measured at the same instant: the Now
+            # latch is the frame end and we read the system clock immediately
+            # after fetching that frame, so the difference is the system
+            # clock error plus a sub-ms readout delay. This is the number
+            # that justifies GPS timing at all.
+            try:
+                _gps_now = gps.create_timestamp(gps.NowSeconds, gps.NowCounts)
+                _skew_ms = (
+                    Time.now() - Time(_gps_now, format="isot")
+                ).to_value("sec") * 1e3
+                logger.debug(
+                    f"GPS vs host clock: gps_now={_gps_now} "
+                    f"host_now={Time.now().isot} skew={_skew_ms:+.1f}ms "
+                    f"(positive = system clock ahead of GPS)"
+                )
+            except Exception as _e:  # diagnostic only, never fatal
+                logger.debug(f"skew calc failed: {_e}")
+            # Always surface the GPS module status (and last-known position)
+            # via the gpsmetadata endpoint, even when we fall back to the
+            # system clock — lets consumers see LOCKED/LOCKING/SEARCHING/
+            # OFFLINE per frame.
+            self._timing["GPS-STAT"] = vsync_status
+            self._timing["GPS-LAT"] = gps.Latitude
+            self._timing["GPS-LON"] = gps.Longitude
+            self._timing["GPS-SSTAT"] = start_status
+            self._timing["GPS-ESTAT"] = end_status
+            # PPS interval in 10 MHz counts. Nominal 10_000_000; the deviation
+            # is the oscillator error and is a *continuous* lock-quality meter,
+            # unlike the categorical status nibble. An undisciplined TCXO sits
+            # at a stable offset (observed +500 = +50 ppm on 2026-08-28); a
+            # genuinely PPS-locked module should converge toward nominal.
+            self._timing["GPS-PPS"] = gps.PPSDelta
+            self._timing["GPS-PPS-PPM"] = round(
+                (gps.PPSDelta - 10_000_000) / 10.0, 2
+            )
+            # `_last_exposure_duration` still holds the duration requested in
+            # start_exposure at this point; keep it as the reference for both
+            # validating the latches and for the derived fallback below.
+            requested = self._last_exposure_duration or 0.0
+            # How far apart the Start and End latches actually are. On a
+            # camera that brackets the shutter with them this equals the
+            # exposure; on the QHY174GPS (observed 2026-08-28, GPS LOCKING)
+            # it is a fixed ~20 us regardless of a 0.5/2/5 s request, i.e.
+            # Start, End and Now all report the *frame end*. So the latches
+            # must be validated against the request before being trusted —
+            # using StartSeconds blindly puts an end-of-exposure time in
+            # DATE-OBS, wrong by the whole exposure.
+            latched_span = (gps.EndSeconds - gps.StartSeconds) + (
+                end_counts - start_counts
+            ) / 1e7
+            self._timing["GPS-SPAN"] = latched_span
+            start_brackets_exposure = (
+                start_status in GPS_TRUSTED_STATUSES
+                and gps.StartSeconds > 0
+                and requested > 0
+                and abs(latched_span - requested) <= max(0.05 * requested, 0.02)
+            )
+            gps_time_usable = (
+                vsync_status in GPS_TRUSTED_STATUSES and gps.NowSeconds > 0
+            )
+            if start_brackets_exposure:
+                # Best case: the module really did latch shutter open/close,
+                # so we need neither GetQHYCCDPreciseExposureInfo nor the
+                # rolling-shutter offset (the QHY174 SDK class refuses both).
+                start_time = gps.create_timestamp(gps.StartSeconds, gps.StartCounts)
+                end_time = gps.create_timestamp(gps.EndSeconds, gps.EndCounts)
+                self._timing["DATE-OBS"] = start_time
+                self._last_exposure_start_time = start_time
+                self._timing["DATE-END"] = end_time
+                self._last_exposure_duration = latched_span
+                self._timing["TIME-SRC"] = "GPS"
+                self._timing["GPS-SEQN"] = gps.SequenceNumber
+                logger.debug(
+                    f"GPS timing from shutter latches: start={start_time} "
+                    f"end={end_time} span={latched_span:.6f}s"
+                )
+            elif vsync_status in GPS_TRUSTED_STATUSES and has_precise_info:
+                end_seconds = (
+                    gps.NowSeconds
+                    + readout_offset_us / 1e6
+                    + line_period_ns.value / 1e9 * 2 * (roi_sy.value // 2)
+                )
+                start_time = gps.create_timestamp(
+                    end_seconds - actual_exposure_us.value / 1e6, gps.NowCounts
+                )
+                end_time = gps.create_timestamp(end_seconds, gps.NowCounts)
+                self._timing["DATE-OBS"] = start_time
+                self._last_exposure_start_time = start_time
+                self._timing["DATE-END"] = end_time
+                self._last_exposure_duration = (
+                    Time(end_time, format="isot") - Time(start_time, format="isot")
+                ).to_value("sec")
+                self._timing["TIME-SRC"] = "GPS"
+                self._timing["GPS-SEQN"] = gps.SequenceNumber
+                self._timing["GPS-LAT"] = gps.Latitude
+                self._timing["GPS-LON"] = gps.Longitude
+                logger.debug(
+                    f"GPS timing: start={start_time}, end={end_time}, status={vsync_status}"
+                )
+            elif gps_time_usable:
+                # The GPS clock is good (absolute time and a ~10 MHz PPS-locked
+                # counter) but the shutter latches do not bracket the exposure
+                # and PreciseExposureInfo is unavailable. The End/Now latch is
+                # the frame end, so anchor DATE-END to GPS and back out
+                # DATE-OBS using the requested duration. This is GPS-accurate
+                # in absolute terms but loses the rolling-shutter correction,
+                # hence a distinct TIME-SRC so downstream can tell them apart.
+                if gps.EndSeconds > 0:
+                    end_time = gps.create_timestamp(gps.EndSeconds, gps.EndCounts)
+                else:
+                    end_time = gps.create_timestamp(gps.NowSeconds, gps.NowCounts)
+                start_time = (
+                    Time(end_time, format="isot") - timedelta(seconds=requested)
+                ).isot
+                self._timing["DATE-OBS"] = start_time
+                self._last_exposure_start_time = start_time
+                self._timing["DATE-END"] = end_time
+                # Leave _last_exposure_duration at the requested value.
+                self._timing["TIME-SRC"] = "GPS-DERIVED"
+                self._timing["GPS-SEQN"] = gps.SequenceNumber
+                logger.debug(
+                    f"GPS-derived timing: end={end_time} (GPS) minus "
+                    f"requested {requested}s -> start={start_time}; "
+                    f"latch span was {latched_span:.6f}s"
+                )
+            else:
+                logger.warning(
+                    f"No trusted GPS timing (start latch={start_status} "
+                    f"ssec={gps.StartSeconds}, now={vsync_status}, "
+                    f"precise_info={has_precise_info}, "
+                    f"pps_ppm={self._timing.get('GPS-PPS-PPM')}); "
+                    f"need status in {GPS_TRUSTED_STATUSES} — using system clock"
+                )
+                self._use_system_clock_timing()
+        except Exception as e:
+            logger.warning(f"GPS parsing failed: {e}, using system clock")
+            self._use_system_clock_timing()
 
     def _use_system_clock_timing(self) -> None:
         """Fallback timing using system clock and requested exposure duration.
@@ -1013,11 +1183,11 @@ class CameraDevice:
 
     @property
     def offset(self) -> int:
-        val = self.libqhyccd.GetQHYCCDParam(self.handle, QHY_CONTROL.OFFSET)
-        return int(val)
+        return int(self._read_param(QHY_CONTROL.OFFSET))
 
     @offset.setter
     def offset(self, value: int) -> None:
+        self._require_no_exposure()
         res = self.libqhyccd.SetQHYCCDParam(
             self.handle, QHY_CONTROL.OFFSET, c_double(float(value))
         )
@@ -1050,6 +1220,7 @@ class CameraDevice:
             raise ValueError(
                 f"ReadoutMode {value} out of range 0-{len(self._readout_modes) - 1}"
             )
+        self._require_no_exposure()
         res = self.libqhyccd.SetQHYCCDReadMode(self.handle, c_uint32(value))
         if res != QHY_SUCCESS:
             raise RuntimeError(f"SetQHYCCDReadMode({value}) failed")
@@ -1086,6 +1257,7 @@ class CameraDevice:
             raise ValueError(
                 f"SetCCDTemperature {value} exceeds maximum allowed (50°C)"
             )
+        self._require_no_exposure()
         res = self.libqhyccd.SetQHYCCDParam(
             self.handle, QHY_CONTROL.COOLER, c_double(value)
         )
@@ -1225,9 +1397,19 @@ class CameraDevice:
     # ICamera methods #
     ###################
     def start_exposure(self, duration: float, light: bool) -> None:
-        if self._camera_state != CameraState.IDLE:
-            raise RuntimeError("Camera is not idle")
+        self._sdk.check()
+        # Claim the camera atomically: route handlers run concurrently on the pool.
+        with self._lock:
+            if self._camera_state != CameraState.IDLE:
+                raise RuntimeError("Camera is not idle")
+            self._camera_state = CameraState.WAITING
+        try:
+            self._start_exposure(duration, light)
+        except Exception:
+            self._camera_state = CameraState.IDLE
+            raise
 
+    def _start_exposure(self, duration: float, light: bool) -> None:
         if duration < 0:
             raise ValueError(
                 f"Duration {duration} is invalid, must be >= 0"
@@ -1292,58 +1474,121 @@ class CameraDevice:
         # method returns immediately, per the asynchronous ASCOM StartExposure
         # contract. ExpQHYCCDSingleFrame blocks for ~the exposure duration on
         # cameras like the QHY174GPS; running it inline would hold the HTTP
-        # handler open and trip the Alpaca client's PUT read timeout.
+        # handler open and trip the Alpaca client's PUT read timeout. It and the
+        # readout run as one job on the SDK worker thread.
         self._exposure_complete.clear()
         self._readout_complete.clear()
-        Thread(target=self._run_exposure, args=(duration,), daemon=True).start()
+        self._abort_requested.clear()
+        self._exposure_seq += 1
+        Thread(
+            target=self._run_exposure,
+            args=(duration, self._exposure_seq),
+            name=f"exposure-{self._config.entity}",
+            daemon=True,
+        ).start()
 
-    def _run_exposure(self, duration: float) -> None:
-        """Worker that runs a single-frame exposure and advances camera state.
+    def _run_exposure(self, duration: float, seq: int) -> None:
+        """Run one exposure and its readout as a single SDK-worker job.
 
         Note: ExpQHYCCDSingleFrame returns QHY_ERROR (0xFFFFFFFF) on actual
         failure but may return other non-zero values as a "pending" status on
         some cameras (e.g. QHY174GPS). Only treat QHY_ERROR as fatal. The call
         blocks for ~the exposure duration on the QHY174GPS but may return early
-        on other cameras, so we wait out any remaining time before advancing.
+        on other cameras, so we wait out any remaining time before reading out.
+
+        This thread only waits on the worker, so the HTTP handlers never block on
+        the SDK. The image is reported ready only once it is in memory.
         """
+        timeout = duration + self._config.sdk_timeout
+        try:
+            img = self._sdk.call(self._expose_and_read, duration, seq, timeout=timeout)
+        except Exception as e:
+            if self._exposure_seq == seq:
+                if self._abort_requested.is_set():
+                    logger.info(f"Exposure ended after abort: {e}")
+                else:
+                    logger.error(f"Exposure failed: {e}")
+                    self._camera_state = CameraState.ERROR
+                self._exposure_complete.set()
+                self._readout_complete.set()
+            return
+
+        if self._exposure_seq != seq or self._abort_requested.is_set():
+            return
+        self._cached_image = img
+        self._image_ready = True
+        self._camera_state = CameraState.IDLE
+        self._exposure_complete.set()
+        self._readout_complete.set()
+
+    def _expose_and_read(self, duration: float, seq: int) -> Optional[np.ndarray]:
+        """Worker-thread body: ExpQHYCCDSingleFrame then GetQHYCCDSingleFrame."""
+        if self._exposure_seq != seq or self._abort_requested.is_set():
+            return None
         t0 = time.monotonic()
         res = self.libqhyccd.ExpQHYCCDSingleFrame(self.handle)
         if res == QHY_ERROR:
-            logger.error("ExpQHYCCDSingleFrame failed")
-            self._camera_state = CameraState.ERROR
-            self._exposure_complete.set()
-            self._readout_complete.set()
-            return
+            raise RuntimeError("ExpQHYCCDSingleFrame failed")
 
-        # If aborted while the SDK call was blocked, abort_exposure has already
-        # reset state and signalled the events — don't clobber it.
-        if self._camera_state != CameraState.EXPOSING:
-            return
-
+        # Wait out the rest of the exposure, but stop early on an abort.
         remaining = duration - (time.monotonic() - t0)
-        if remaining > 0:
-            time.sleep(remaining)
+        if remaining > 0 and self._abort_requested.wait(remaining):
+            return None
+        if self._abort_requested.is_set():
+            return None
 
         self._camera_state = CameraState.READING
         self._exposure_complete.set()
-
-        # No way to monitor the readout transition, just blow through it for now
-        time.sleep(0.1)
-        self._readout_complete.set()
-
-        self._image_ready = True
-        self._camera_state = CameraState.IDLE
+        self._camera_state = CameraState.DOWNLOADING
+        return self._read_frame()
 
     def abort_exposure(self) -> None:
-        if self._camera_state in (
-            CameraState.EXPOSING,
-            CameraState.READING,
-            CameraState.WAITING,
-        ):
-            res = self.libqhyccd.CancelQHYCCDExposingAndReadout(self.handle)
+        if not self.exposure_in_progress:
+            return
+        self._abort_requested.set()
+        # Cancel only before readout begins. Cancelling a transfer already under way
+        # can wedge the camera until a power cycle (rusty-photon/rusty-photon#755), so
+        # a readout that has started is left to finish and its frame is discarded.
+        # This one call deliberately bypasses the worker: it is the SDK's way to
+        # interrupt the ExpQHYCCDSingleFrame the worker is blocked in.
+        if self._camera_state in (CameraState.WAITING, CameraState.EXPOSING):
+            res = self.libqhyccd.raw.CancelQHYCCDExposingAndReadout(self.handle)
             if res != QHY_SUCCESS:
                 logger.warning("CancelQHYCCDExposingAndReadout failed")
-            self._camera_state = CameraState.IDLE
-            self._image_ready = False
-            self._exposure_complete.set()
-            self._readout_complete.set()
+        self._camera_state = CameraState.IDLE
+        self._image_ready = False
+        self._cached_image = None
+        self._exposure_complete.set()
+        self._readout_complete.set()
+
+    @property
+    def exposure_in_progress(self) -> bool:
+        return self._camera_state in EXPOSURE_STATES
+
+    @property
+    def sdk_wedged(self) -> Optional[str]:
+        """Why the SDK is unusable, or None. Clears only on a driver restart."""
+        return self._sdk.wedged
+
+    def _require_no_exposure(self) -> None:
+        """Refuse settings changes mid-exposure; the SDK must not be called then."""
+        if self.exposure_in_progress:
+            raise RuntimeError("Cannot change camera settings during an exposure")
+
+    def _seed_param_cache(self) -> None:
+        """Read the values served while an exposure owns the SDK."""
+        for control in (
+            QHY_CONTROL.CURTEMP,
+            QHY_CONTROL.CURPWM,
+            QHY_CONTROL.GAIN,
+            QHY_CONTROL.OFFSET,
+        ):
+            self._read_param(control)
+
+    def _read_param(self, control: int) -> float:
+        """GetQHYCCDParam, served from the last value read while an exposure owns the SDK."""
+        if self.exposure_in_progress and control in self._param_cache:
+            return self._param_cache[control]
+        val = self.libqhyccd.GetQHYCCDParam(self.handle, control)
+        self._param_cache[control] = val
+        return val

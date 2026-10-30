@@ -50,7 +50,11 @@ class CFWDevice:
 
     @property
     def _lib(self):
-        """Borrow the camera's loaded library."""
+        """Borrow the camera's loaded library.
+
+        This is the camera's SerializedLibrary, so CFW calls queue on the same SDK
+        worker thread as the camera's and never run during its readout.
+        """
         return self._camera.libqhyccd
 
     # ─── ASCOM Common ────────────────────────────────────────────────
@@ -148,6 +152,8 @@ class CFWDevice:
         """
         if not self._connected:
             raise RuntimeError("Filter wheel is not connected")
+        if self._camera.exposure_in_progress:
+            raise RuntimeError("Cannot move the filter wheel during an exposure")
 
         num_filters = len(self._config.names)
         if value < 0 or value >= num_filters:
@@ -177,7 +183,7 @@ class CFWDevice:
 
     def _ensure_cfw_signatures(self) -> None:
         """Declare ctypes signatures for CFW functions (idempotent)."""
-        lib = self._lib
+        lib = self._lib.raw
         if hasattr(lib, "_cfw_sigs_set"):
             return
 
@@ -202,7 +208,13 @@ class CFWDevice:
         versions return ASCII digits, so we handle both.
         """
         buf = create_string_buffer(64)
-        res = self._lib.GetQHYCCDCFWStatus(self._handle, buf)
+        try:
+            res = self._lib.GetQHYCCDCFWStatus(self._handle, buf)
+        except Exception as e:
+            # SDK busy or wedged. Report "moving" so _wait_for_move keeps polling
+            # until its own timeout, instead of the poll thread dying.
+            logger.warning(f"GetQHYCCDCFWStatus failed: {e}")
+            return -1
         if res != QHY_SUCCESS:
             logger.warning(f"GetQHYCCDCFWStatus failed (res={res})")
             return -1

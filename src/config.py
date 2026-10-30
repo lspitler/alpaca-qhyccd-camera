@@ -61,6 +61,12 @@ class DeviceConfig(BaseModel):
         "pixels are right-shifted by (16 - sensor_bpp) to produce true ADU values.",
     )
     defaults: DeviceDefaults = Field(default_factory=DeviceDefaults)
+    sdk_timeout: float = Field(
+        default=60.0,
+        description="Seconds an SDK call may take (an exposure gets its duration on "
+        "top) before the camera is treated as wedged and every later call fails at "
+        "once. Only a camera power cycle and a driver restart recover it.",
+    )
 
 
 class ServerConfig(BaseModel):
