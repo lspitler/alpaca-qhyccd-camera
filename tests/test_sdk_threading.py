@@ -319,3 +319,38 @@ def test_filter_wheel_uses_the_camera_worker(cam):
         cfw.position = 1
     gate.set()
     wait_ready(cam)
+
+
+def test_gps_timing_survives_the_readout_move(cam):
+    """QHY174GPS latches ~20 us apart, LOCKED: expect GPS-DERIVED timing."""
+    import ctypes
+
+    from libqhyccd import QHY_GPS
+
+    end_s = 1_000_000_000  # GPS seconds of the frame-end latch
+    fake = cam.fake
+    plain = fake._GetQHYCCDSingleFrame
+
+    def frame_with_gps(h, w, hh, bpp, ch, data):
+        res = plain(h, w, hh, bpp, ch, data)
+        g = QHY_GPS.from_address(ctypes.addressof(data))
+        g.StartFlag = g.EndFlag = g.NowFlag = 0x30  # LOCKED
+        g.StartSeconds, g.EndSeconds, g.NowSeconds = end_s, end_s, end_s
+        g.StartCounts[:] = [0, 0, 0]
+        g.EndCounts[:] = [0, 0, 200]  # 20 us after start
+        g.NowCounts[:] = [0, 0, 200]
+        return res
+
+    fake._GetQHYCCDSingleFrame = frame_with_gps
+    cam._has_gps = True
+    cam.start_exposure(0.05, True)
+    wait_ready(cam)
+    t = cam._timing
+    assert t["TIME-SRC"] == "GPS-DERIVED", t
+    assert t["GPS-STAT"] == "LOCKED"
+    assert t["DATE-END"] == QHY_GPS.create_timestamp(end_s, bytes([0, 0, 200]))
+    from astropy.time import Time
+
+    span = (Time(t["DATE-END"]) - Time(t["DATE-OBS"])).to_value("sec")
+    assert span == pytest.approx(0.05, abs=1e-6)
+    assert cam.last_exposure_start_time == t["DATE-OBS"]
