@@ -9,7 +9,8 @@ from ctypes import (
 )
 from datetime import datetime, timedelta, timezone
 from enum import IntEnum
-from threading import Event, Lock, Thread
+import queue
+from threading import Event, Lock, Thread, current_thread
 import time
 from typing import Dict, List, Optional
 
@@ -54,6 +55,141 @@ class SensorType(IntEnum):
     LRGB = 5
 
 
+# States in which an exposure owns the SDK (see SdkWorker).
+EXPOSURE_STATES = (
+    CameraState.WAITING,
+    CameraState.EXPOSING,
+    CameraState.READING,
+    CameraState.DOWNLOADING,
+)
+
+
+class SdkWedgedError(RuntimeError):
+    """An SDK call never returned; the camera needs a power cycle."""
+
+
+class _SdkJob:
+    def __init__(self, fn, args):
+        self.fn = fn
+        self.args = args
+        self.started = False
+        self.cancelled = False
+        self.done = Event()
+        self.result = None
+        self.error: Optional[BaseException] = None
+
+
+class SdkWorker:
+    """Runs libqhyccd calls on one dedicated thread, one at a time.
+
+    The QHY SDK is not safe to drive from several threads: GetQHYCCDSingleFrame can
+    block forever unless it runs on the thread that called ExpQHYCCDSingleFrame, and
+    other calls made during an exposure or readout can hang it
+    (open-astro/AlpacaBridge .github/instructions/qhy.instructions.md). Before this
+    the driver called the SDK from the HTTP event loop, a new thread per exposure,
+    the connect thread and the filter-wheel poll thread.
+
+    The SDK has no timeouts of its own. A call that overruns its timeout is left
+    running (a thread stuck in C can't be stopped) and the worker is marked wedged:
+    every later call fails at once with SdkWedgedError instead of queueing behind
+    it. Only a camera power cycle and a driver restart clear that.
+    """
+
+    def __init__(self, name: str):
+        self._name = name
+        self._queue: queue.Queue[_SdkJob] = queue.Queue()
+        self._lock = Lock()
+        self.wedged: Optional[str] = None
+        # Name of the SDK function the worker is inside, for the wedge message.
+        self.current: Optional[str] = None
+        self._thread = Thread(target=self._loop, name=f"sdk-{name}", daemon=True)
+        self._thread.start()
+
+    def _loop(self) -> None:
+        while True:
+            job = self._queue.get()
+            with self._lock:
+                if job.cancelled:
+                    continue
+                job.started = True
+            try:
+                job.result = self._run(job.fn, job.args)
+            except BaseException as e:
+                job.error = e
+            finally:
+                job.done.set()
+
+    def _run(self, fn, args):
+        outer = self.current
+        self.current = getattr(fn, "__name__", repr(fn))
+        try:
+            return fn(*args)
+        finally:
+            self.current = outer
+
+    def check(self) -> None:
+        if self.wedged:
+            raise SdkWedgedError(self.wedged)
+
+    def call(self, fn, *args, timeout: float):
+        """Run fn(*args) on the worker and return its result.
+
+        `timeout` bounds the wait for the worker to be free (overrunning it drops the
+        call and raises TimeoutError) and then the call itself (overrunning that marks
+        the worker wedged). Calls made from the worker thread run directly.
+        """
+        if current_thread() is self._thread:
+            return self._run(fn, args)
+        self.check()
+        name = getattr(fn, "__name__", repr(fn))
+        job = _SdkJob(fn, args)
+        self._queue.put(job)
+        start_deadline = time.monotonic() + timeout
+        while not job.done.wait(0.2):
+            with self._lock:
+                if job.started:
+                    break
+                if self.wedged or time.monotonic() >= start_deadline:
+                    job.cancelled = True
+            if job.cancelled:
+                self.check()
+                raise TimeoutError(f"SDK busy: {name} could not start within {timeout:.0f}s")
+        if not job.done.wait(timeout):
+            stuck = self.current or name
+            self.wedged = (
+                f"{stuck} did not return within {timeout:.0f}s; "
+                "the camera needs a power cycle and a driver restart"
+            )
+            logger.error(f"{self._name}: {self.wedged}")
+            raise SdkWedgedError(self.wedged)
+        if job.error is not None:
+            raise job.error
+        return job.result
+
+
+class SerializedLibrary:
+    """The loaded libqhyccd, with every function call routed through an SdkWorker.
+
+    `raw` is the underlying CDLL, for declaring ctypes signatures and for the one
+    call that must bypass the worker (CancelQHYCCDExposingAndReadout).
+    """
+
+    def __init__(self, lib, worker: SdkWorker, timeout: float):
+        self.raw = lib
+        self._worker = worker
+        self._timeout = timeout
+
+    def __getattr__(self, name: str):
+        fn = getattr(self.raw, name)
+        worker, timeout = self._worker, self._timeout
+
+        def call(*args):
+            return worker.call(fn, *args, timeout=timeout)
+
+        call.__name__ = name
+        return call
+
+
 class CameraDevice:
     """Low-level driver for the QHYCCD camera (libqhyccd)."""
 
@@ -65,6 +201,9 @@ class CameraDevice:
 
         self.libqhyccd = None
         self.handle = None
+        self._sdk = SdkWorker(device_config.entity)
+        # Last-read parameter values, served while an exposure owns the SDK.
+        self._param_cache: Dict[int, float] = {}
 
         self._connected = False
         self._connecting = False
@@ -75,6 +214,10 @@ class CameraDevice:
         self._cached_image: Optional[np.ndarray] = None
         self._exposure_complete = Event()
         self._readout_complete = Event()
+        self._abort_requested = Event()
+        # Bumped per exposure, so a finished or aborted one can't touch the state of
+        # the exposure that replaced it.
+        self._exposure_seq = 0
 
         self._last_exposure_duration: Optional[float] = None
         self._last_exposure_start_time: Optional[str] = None
@@ -134,7 +277,11 @@ class CameraDevice:
         try:
             # Load the library
             if self.libqhyccd is None:
-                self.libqhyccd = load_qhyccd_library(self._library_path)
+                self.libqhyccd = SerializedLibrary(
+                    load_qhyccd_library(self._library_path),
+                    self._sdk,
+                    self._config.sdk_timeout,
+                )
 
             # Initialize resources
             res = self.libqhyccd.InitQHYCCDResource()
@@ -208,6 +355,15 @@ class CameraDevice:
 
             # Set remaining default parameters (temperature, gain, offset, binning, etc.)
             self._set_default_parameters()
+
+            # Seed the values served while an exposure owns the SDK
+            for control in (
+                QHY_CONTROL.CURTEMP,
+                QHY_CONTROL.CURPWM,
+                QHY_CONTROL.GAIN,
+                QHY_CONTROL.OFFSET,
+            ):
+                self._read_param(control)
 
             # Use camera model as sensor name
             self._sensor_name = self._camera_model
@@ -530,10 +686,15 @@ class CameraDevice:
         if not self._connected:
             return
         try:
-            if self._camera_state in (CameraState.EXPOSING, CameraState.READING):
+            if self.exposure_in_progress:
                 self.abort_exposure()
             if self.handle is not None:
+                # Queued behind any readout still running, so the handle is never
+                # closed under a live transfer. Fails at once if the SDK is wedged.
                 self.libqhyccd.CloseQHYCCD(self.handle)
+        except Exception as e:
+            logger.error(f"Disconnect error: {e}")
+        try:
             self._connected = False
             self._camera_state = CameraState.IDLE
             # Reset all session state so reconnect starts fresh
@@ -548,6 +709,7 @@ class CameraDevice:
             self._start_y = 0
             self._num_x = 0
             self._num_y = 0
+            self._param_cache = {}
             self.handle = None
             logger.info(f"Disconnected from camera {self._config.entity}")
         except Exception as e:
@@ -569,6 +731,7 @@ class CameraDevice:
         if value < 1 or value > self._max_bin_x:
             raise ValueError(f"BinX {value} not in range 1-{self._max_bin_x}")
         if value != self._bin_x:
+            self._require_no_exposure()
             self._set_roi(bin_x=value, bin_y=value)
 
     @property
@@ -580,6 +743,7 @@ class CameraDevice:
         if value < 1 or value > self._max_bin_y:
             raise ValueError(f"BinX {value} not in range 1-{self._max_bin_y}")
         if value != self._bin_y:
+            self._require_no_exposure()
             self._set_roi(bin_x=value, bin_y=value)
 
     @property
@@ -624,18 +788,15 @@ class CameraDevice:
 
     @property
     def ccd_temperature(self) -> float:
-        val = self.libqhyccd.GetQHYCCDParam(self.handle, QHY_CONTROL.CURTEMP)
-        return val
+        return self._read_param(QHY_CONTROL.CURTEMP)
 
     @property
     def cooler_on(self) -> bool:
-        val = self.libqhyccd.GetQHYCCDParam(self.handle, QHY_CONTROL.CURPWM)
-        return val > 0
+        return self._read_param(QHY_CONTROL.CURPWM) > 0
 
     @property
     def cooler_power(self) -> float:
-        val = self.libqhyccd.GetQHYCCDParam(self.handle, QHY_CONTROL.CURPWM)
-        return val / 255.0 * 100.0
+        return self._read_param(QHY_CONTROL.CURPWM) / 255.0 * 100.0
 
     @property
     def exposure_max(self) -> float:
@@ -655,11 +816,11 @@ class CameraDevice:
 
     @property
     def gain(self) -> int:
-        val = self.libqhyccd.GetQHYCCDParam(self.handle, QHY_CONTROL.GAIN)
-        return int(val)
+        return int(self._read_param(QHY_CONTROL.GAIN))
 
     @gain.setter
     def gain(self, value: int) -> None:
+        self._require_no_exposure()
         res = self.libqhyccd.SetQHYCCDParam(
             self.handle, QHY_CONTROL.GAIN, c_double(float(value))
         )
@@ -680,17 +841,22 @@ class CameraDevice:
 
     @property
     def image_array(self) -> np.ndarray:
-        """Returns a 2D numpy array of the last captured image."""
-        if not self._image_ready:
+        """Returns a 2D numpy array of the last captured image.
+
+        The frame was already read out on the SDK worker by _run_exposure, so this
+        never touches the SDK. The image stays available until the next exposure
+        starts (ASCOM spec).
+        """
+        if not self._image_ready or self._cached_image is None:
             raise RuntimeError("No image ready")
+        return self._cached_image
 
-        # Return cached image if already read (ASCOM spec: image stays available
-        # until the next exposure starts)
-        if self._cached_image is not None:
-            return self._cached_image
+    def _read_frame(self) -> np.ndarray:
+        """Read the exposed frame out of the SDK and parse its GPS timing.
 
-        self._camera_state = CameraState.DOWNLOADING
-
+        Runs on the SDK worker, straight after ExpQHYCCDSingleFrame and on the same
+        thread, which GetQHYCCDSingleFrame needs.
+        """
         # Get current ROI from camera
         roi_sx = c_uint32()
         roi_sy = c_uint32()
@@ -753,7 +919,6 @@ class CameraDevice:
             self.handle, byref(img_w), byref(img_h), byref(bpp), byref(channels), data
         )
         if res != QHY_SUCCESS:
-            self._camera_state = CameraState.ERROR
             raise RuntimeError("GetQHYCCDSingleFrame failed")
 
         # Parse GPS timing information from the raw row-major buffer before
@@ -944,9 +1109,6 @@ class CameraDevice:
             >> shift
         )
 
-        self._camera_state = CameraState.IDLE
-        self._cached_image = img
-
         logger.debug(f"Image: {img.shape[0]}x{img.shape[1]}, dtype={img.dtype}")
         return img
 
@@ -1013,11 +1175,11 @@ class CameraDevice:
 
     @property
     def offset(self) -> int:
-        val = self.libqhyccd.GetQHYCCDParam(self.handle, QHY_CONTROL.OFFSET)
-        return int(val)
+        return int(self._read_param(QHY_CONTROL.OFFSET))
 
     @offset.setter
     def offset(self, value: int) -> None:
+        self._require_no_exposure()
         res = self.libqhyccd.SetQHYCCDParam(
             self.handle, QHY_CONTROL.OFFSET, c_double(float(value))
         )
@@ -1050,6 +1212,7 @@ class CameraDevice:
             raise ValueError(
                 f"ReadoutMode {value} out of range 0-{len(self._readout_modes) - 1}"
             )
+        self._require_no_exposure()
         res = self.libqhyccd.SetQHYCCDReadMode(self.handle, c_uint32(value))
         if res != QHY_SUCCESS:
             raise RuntimeError(f"SetQHYCCDReadMode({value}) failed")
@@ -1086,6 +1249,7 @@ class CameraDevice:
             raise ValueError(
                 f"SetCCDTemperature {value} exceeds maximum allowed (50°C)"
             )
+        self._require_no_exposure()
         res = self.libqhyccd.SetQHYCCDParam(
             self.handle, QHY_CONTROL.COOLER, c_double(value)
         )
@@ -1225,9 +1389,19 @@ class CameraDevice:
     # ICamera methods #
     ###################
     def start_exposure(self, duration: float, light: bool) -> None:
-        if self._camera_state != CameraState.IDLE:
-            raise RuntimeError("Camera is not idle")
+        self._sdk.check()
+        # Claim the camera atomically: route handlers run concurrently on the pool.
+        with self._lock:
+            if self._camera_state != CameraState.IDLE:
+                raise RuntimeError("Camera is not idle")
+            self._camera_state = CameraState.WAITING
+        try:
+            self._start_exposure(duration, light)
+        except Exception:
+            self._camera_state = CameraState.IDLE
+            raise
 
+    def _start_exposure(self, duration: float, light: bool) -> None:
         if duration < 0:
             raise ValueError(
                 f"Duration {duration} is invalid, must be >= 0"
@@ -1292,58 +1466,111 @@ class CameraDevice:
         # method returns immediately, per the asynchronous ASCOM StartExposure
         # contract. ExpQHYCCDSingleFrame blocks for ~the exposure duration on
         # cameras like the QHY174GPS; running it inline would hold the HTTP
-        # handler open and trip the Alpaca client's PUT read timeout.
+        # handler open and trip the Alpaca client's PUT read timeout. It and the
+        # readout run as one job on the SDK worker thread.
         self._exposure_complete.clear()
         self._readout_complete.clear()
-        Thread(target=self._run_exposure, args=(duration,), daemon=True).start()
+        self._abort_requested.clear()
+        self._exposure_seq += 1
+        Thread(
+            target=self._run_exposure,
+            args=(duration, self._exposure_seq),
+            name=f"exposure-{self._config.entity}",
+            daemon=True,
+        ).start()
 
-    def _run_exposure(self, duration: float) -> None:
-        """Worker that runs a single-frame exposure and advances camera state.
+    def _run_exposure(self, duration: float, seq: int) -> None:
+        """Run one exposure and its readout as a single SDK-worker job.
 
         Note: ExpQHYCCDSingleFrame returns QHY_ERROR (0xFFFFFFFF) on actual
         failure but may return other non-zero values as a "pending" status on
         some cameras (e.g. QHY174GPS). Only treat QHY_ERROR as fatal. The call
         blocks for ~the exposure duration on the QHY174GPS but may return early
-        on other cameras, so we wait out any remaining time before advancing.
+        on other cameras, so we wait out any remaining time before reading out.
+
+        This thread only waits on the worker, so the HTTP handlers never block on
+        the SDK. The image is reported ready only once it is in memory.
         """
+        timeout = duration + self._config.sdk_timeout
+        try:
+            img = self._sdk.call(self._expose_and_read, duration, seq, timeout=timeout)
+        except Exception as e:
+            if self._exposure_seq == seq:
+                if self._abort_requested.is_set():
+                    logger.info(f"Exposure ended after abort: {e}")
+                else:
+                    logger.error(f"Exposure failed: {e}")
+                    self._camera_state = CameraState.ERROR
+                self._exposure_complete.set()
+                self._readout_complete.set()
+            return
+
+        if self._exposure_seq != seq or self._abort_requested.is_set():
+            return
+        self._cached_image = img
+        self._image_ready = True
+        self._camera_state = CameraState.IDLE
+        self._exposure_complete.set()
+        self._readout_complete.set()
+
+    def _expose_and_read(self, duration: float, seq: int) -> Optional[np.ndarray]:
+        """Worker-thread body: ExpQHYCCDSingleFrame then GetQHYCCDSingleFrame."""
+        if self._exposure_seq != seq or self._abort_requested.is_set():
+            return None
         t0 = time.monotonic()
         res = self.libqhyccd.ExpQHYCCDSingleFrame(self.handle)
         if res == QHY_ERROR:
-            logger.error("ExpQHYCCDSingleFrame failed")
-            self._camera_state = CameraState.ERROR
-            self._exposure_complete.set()
-            self._readout_complete.set()
-            return
+            raise RuntimeError("ExpQHYCCDSingleFrame failed")
 
-        # If aborted while the SDK call was blocked, abort_exposure has already
-        # reset state and signalled the events — don't clobber it.
-        if self._camera_state != CameraState.EXPOSING:
-            return
-
+        # Wait out the rest of the exposure, but stop early on an abort.
         remaining = duration - (time.monotonic() - t0)
-        if remaining > 0:
-            time.sleep(remaining)
+        if remaining > 0 and self._abort_requested.wait(remaining):
+            return None
+        if self._abort_requested.is_set():
+            return None
 
         self._camera_state = CameraState.READING
         self._exposure_complete.set()
-
-        # No way to monitor the readout transition, just blow through it for now
-        time.sleep(0.1)
-        self._readout_complete.set()
-
-        self._image_ready = True
-        self._camera_state = CameraState.IDLE
+        self._camera_state = CameraState.DOWNLOADING
+        return self._read_frame()
 
     def abort_exposure(self) -> None:
-        if self._camera_state in (
-            CameraState.EXPOSING,
-            CameraState.READING,
-            CameraState.WAITING,
-        ):
-            res = self.libqhyccd.CancelQHYCCDExposingAndReadout(self.handle)
+        if not self.exposure_in_progress:
+            return
+        self._abort_requested.set()
+        # Cancel only before readout begins. Cancelling a transfer already under way
+        # can wedge the camera until a power cycle (rusty-photon/rusty-photon#755), so
+        # a readout that has started is left to finish and its frame is discarded.
+        # This one call deliberately bypasses the worker: it is the SDK's way to
+        # interrupt the ExpQHYCCDSingleFrame the worker is blocked in.
+        if self._camera_state in (CameraState.WAITING, CameraState.EXPOSING):
+            res = self.libqhyccd.raw.CancelQHYCCDExposingAndReadout(self.handle)
             if res != QHY_SUCCESS:
                 logger.warning("CancelQHYCCDExposingAndReadout failed")
-            self._camera_state = CameraState.IDLE
-            self._image_ready = False
-            self._exposure_complete.set()
-            self._readout_complete.set()
+        self._camera_state = CameraState.IDLE
+        self._image_ready = False
+        self._cached_image = None
+        self._exposure_complete.set()
+        self._readout_complete.set()
+
+    @property
+    def exposure_in_progress(self) -> bool:
+        return self._camera_state in EXPOSURE_STATES
+
+    @property
+    def sdk_wedged(self) -> Optional[str]:
+        """Why the SDK is unusable, or None. Clears only on a driver restart."""
+        return self._sdk.wedged
+
+    def _require_no_exposure(self) -> None:
+        """Refuse settings changes mid-exposure; the SDK must not be called then."""
+        if self.exposure_in_progress:
+            raise RuntimeError("Cannot change camera settings during an exposure")
+
+    def _read_param(self, control: int) -> float:
+        """GetQHYCCDParam, served from the last value read while an exposure owns the SDK."""
+        if self.exposure_in_progress and control in self._param_cache:
+            return self._param_cache[control]
+        val = self.libqhyccd.GetQHYCCDParam(self.handle, control)
+        self._param_cache[control] = val
+        return val

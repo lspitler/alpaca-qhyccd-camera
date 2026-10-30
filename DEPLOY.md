@@ -453,6 +453,16 @@ disturbed on site (2026-09-29). Host reboots, `USBDEVFS_RESET` and unplugging th
 12 V (TEC only) do not fix it. **Unplugging the camera's USB cable for ~30 s does**:
 confirm `c174` appears in `dmesg` before `c175`, then `docker restart`. The GPS
 receiver cold-starts too, so expect `LOCKING` for a minute or more afterwards.
+
+Since 2026-10-31 the server runs every SDK call on one worker thread, with the
+exposure and its readout as one job, which is what the SDK requires. The HTTP
+routes run on FastAPI's thread pool, so a wedged call no longer freezes the whole
+server. If a call overruns `sdk_timeout` (per device, default 60 s; an exposure
+gets its duration on top), the server logs `<call> did not return within …; the
+camera needs a power cycle and a driver restart`. `CameraState` then goes to
+`Error`, and every later call fails at once with that message, which clients see
+as a `DriverException`. Nothing short of the USB power cut above and a
+`docker restart` clears it. Offline tests: `python -m pytest tests/test_sdk_threading.py`.
 A watchdog on this box automates the recovery; if the target machine is
 unattended, port it:
 

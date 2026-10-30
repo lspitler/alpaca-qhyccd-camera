@@ -73,7 +73,7 @@ def _connected_property(device: CFWDevice, value, params):
 # ASCOM Methods Common To All Devices #
 #######################################
 @router.put("/{devnum}/action", summary="")
-async def action(devnum: int, params: AlpacaPutParams = Depends(alpaca_put_params)):
+def action(devnum: int, params: AlpacaPutParams = Depends(alpaca_put_params)):
     get_device(devnum)
     return MethodResponse.create(
         client_transaction_id=params.client_transaction_id,
@@ -82,7 +82,7 @@ async def action(devnum: int, params: AlpacaPutParams = Depends(alpaca_put_param
 
 
 @router.put("/{devnum}/commandblind", summary="")
-async def commandblind(devnum: int, params: AlpacaPutParams = Depends(alpaca_put_params)):
+def commandblind(devnum: int, params: AlpacaPutParams = Depends(alpaca_put_params)):
     get_device(devnum)
     return MethodResponse.create(
         client_transaction_id=params.client_transaction_id,
@@ -91,7 +91,7 @@ async def commandblind(devnum: int, params: AlpacaPutParams = Depends(alpaca_put
 
 
 @router.put("/{devnum}/commandbool", summary="")
-async def commandbool(devnum: int, params: AlpacaPutParams = Depends(alpaca_put_params)):
+def commandbool(devnum: int, params: AlpacaPutParams = Depends(alpaca_put_params)):
     get_device(devnum)
     return MethodResponse.create(
         client_transaction_id=params.client_transaction_id,
@@ -100,7 +100,7 @@ async def commandbool(devnum: int, params: AlpacaPutParams = Depends(alpaca_put_
 
 
 @router.put("/{devnum}/commandstring", summary="")
-async def commandstring(devnum: int, params: AlpacaPutParams = Depends(alpaca_put_params)):
+def commandstring(devnum: int, params: AlpacaPutParams = Depends(alpaca_put_params)):
     get_device(devnum)
     return MethodResponse.create(
         client_transaction_id=params.client_transaction_id,
@@ -109,7 +109,7 @@ async def commandstring(devnum: int, params: AlpacaPutParams = Depends(alpaca_pu
 
 
 @router.put("/{devnum}/connect", summary="")
-async def connect(devnum: int, params: AlpacaPutParams = Depends(alpaca_put_params)):
+def connect(devnum: int, params: AlpacaPutParams = Depends(alpaca_put_params)):
     device = get_device(devnum)
     try:
         device.connect()
@@ -124,7 +124,7 @@ async def connect(devnum: int, params: AlpacaPutParams = Depends(alpaca_put_para
 
 
 @router.get("/{devnum}/connected", summary="")
-async def connected_get(devnum: int, params: AlpacaGetParams = Depends()):
+def connected_get(devnum: int, params: AlpacaGetParams = Depends()):
     device = get_device(devnum)
     return PropertyResponse.create(
         value=device.connected,
@@ -133,7 +133,7 @@ async def connected_get(devnum: int, params: AlpacaGetParams = Depends()):
 
 
 @router.put("/{devnum}/connected", summary="")
-async def connected_put(devnum: int, params: AlpacaPutParams = Depends(alpaca_put_params)):
+def connected_put(devnum: int, params: AlpacaPutParams = Depends(alpaca_put_params)):
     device = get_device(devnum)
     value = params.get("Connected")
     if value is None:
@@ -154,7 +154,7 @@ async def connected_put(devnum: int, params: AlpacaPutParams = Depends(alpaca_pu
 
 
 @router.get("/{devnum}/connecting", summary="")
-async def connecting_get(devnum: int, params: AlpacaGetParams = Depends()):
+def connecting_get(devnum: int, params: AlpacaGetParams = Depends()):
     device = get_device(devnum)
     return PropertyResponse.create(
         value=device.connecting,
@@ -163,7 +163,7 @@ async def connecting_get(devnum: int, params: AlpacaGetParams = Depends()):
 
 
 @router.get("/{devnum}/description", summary="")
-async def description(devnum: int, params: AlpacaGetParams = Depends()):
+def description(devnum: int, params: AlpacaGetParams = Depends()):
     get_device(devnum)
     return PropertyResponse.create(
         value=DeviceMetadata.Description,
@@ -172,7 +172,7 @@ async def description(devnum: int, params: AlpacaGetParams = Depends()):
 
 
 @router.get("/{devnum}/devicestate", summary="")
-async def devicestate(devnum: int, params: AlpacaGetParams = Depends()):
+def devicestate(devnum: int, params: AlpacaGetParams = Depends()):
     device = get_device(devnum)
     if not device.connected:
         return PropertyResponse.create(
@@ -198,7 +198,7 @@ async def devicestate(devnum: int, params: AlpacaGetParams = Depends()):
 
 
 @router.put("/{devnum}/disconnect", summary="")
-async def disconnect(devnum: int, params: AlpacaPutParams = Depends(alpaca_put_params)):
+def disconnect(devnum: int, params: AlpacaPutParams = Depends(alpaca_put_params)):
     device = get_device(devnum)
     try:
         device.disconnect()
@@ -213,7 +213,7 @@ async def disconnect(devnum: int, params: AlpacaPutParams = Depends(alpaca_put_p
 
 
 @router.get("/{devnum}/driverinfo", summary="")
-async def driverinfo(devnum: int, params: AlpacaGetParams = Depends()):
+def driverinfo(devnum: int, params: AlpacaGetParams = Depends()):
     get_device(devnum)
     return PropertyResponse.create(
         value=DeviceMetadata.Info,
@@ -222,7 +222,7 @@ async def driverinfo(devnum: int, params: AlpacaGetParams = Depends()):
 
 
 @router.get("/{devnum}/driverversion", summary="")
-async def driverversion(devnum: int, params: AlpacaGetParams = Depends()):
+def driverversion(devnum: int, params: AlpacaGetParams = Depends()):
     get_device(devnum)
     return PropertyResponse.create(
         value=DeviceMetadata.Version,
@@ -231,7 +231,7 @@ async def driverversion(devnum: int, params: AlpacaGetParams = Depends()):
 
 
 @router.get("/{devnum}/interfaceversion", summary="")
-async def interfaceversion(devnum: int, params: AlpacaGetParams = Depends()):
+def interfaceversion(devnum: int, params: AlpacaGetParams = Depends()):
     get_device(devnum)
     return PropertyResponse.create(
         value=DeviceMetadata.InterfaceVersion,
@@ -240,7 +240,7 @@ async def interfaceversion(devnum: int, params: AlpacaGetParams = Depends()):
 
 
 @router.get("/{devnum}/name", summary="")
-async def name(devnum: int, params: AlpacaGetParams = Depends()):
+def name(devnum: int, params: AlpacaGetParams = Depends()):
     get_device(devnum)
     return PropertyResponse.create(
         value=DeviceMetadata.Name,
@@ -249,7 +249,7 @@ async def name(devnum: int, params: AlpacaGetParams = Depends()):
 
 
 @router.get("/{devnum}/supportedactions", summary="")
-async def supportedactions(devnum: int, params: AlpacaGetParams = Depends()):
+def supportedactions(devnum: int, params: AlpacaGetParams = Depends()):
     get_device(devnum)
     return PropertyResponse.create(
         value=[],
@@ -261,25 +261,25 @@ async def supportedactions(devnum: int, params: AlpacaGetParams = Depends()):
 # IFilterWheel properties  #
 ############################
 @router.get("/{devnum}/focusoffsets", summary="")
-async def focusoffsets(devnum: int, params: AlpacaGetParams = Depends()):
+def focusoffsets(devnum: int, params: AlpacaGetParams = Depends()):
     device = get_device(devnum)
     return _connected_property(device, device.focus_offsets, params)
 
 
 @router.get("/{devnum}/names", summary="")
-async def names(devnum: int, params: AlpacaGetParams = Depends()):
+def names(devnum: int, params: AlpacaGetParams = Depends()):
     device = get_device(devnum)
     return _connected_property(device, device.names, params)
 
 
 @router.get("/{devnum}/position", summary="")
-async def position_get(devnum: int, params: AlpacaGetParams = Depends()):
+def position_get(devnum: int, params: AlpacaGetParams = Depends()):
     device = get_device(devnum)
     return _connected_property(device, device.position, params)
 
 
 @router.put("/{devnum}/position", summary="")
-async def position_put(
+def position_put(
     devnum: int,
     Position: Annotated[str, Form()],
     params: AlpacaPutParams = Depends(alpaca_put_params),
